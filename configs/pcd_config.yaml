@@ -11,7 +11,7 @@ meshing:
   voxel_size: 20        # block size in metres
   margin_seam: 0.2
   margin_discard: 0.2
-  num_parallel: 10
+  num_parallel: 4
 
   # Triangle quality filters
   max_edge_length: 0.5  # reject triangles with edges > this (metres)
