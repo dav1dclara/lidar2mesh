@@ -1,5 +1,6 @@
 import os
 import shutil
+import argparse
 import numpy as np
 import torch
 import laspy
@@ -11,8 +12,20 @@ from datetime import datetime
 
 start = datetime.now()
 
+# ── CLI args ──────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="NKSR chunked reconstruction")
+parser.add_argument("--config", default="configs/nksr_config.yaml",
+                    help="Path to YAML config")
+parser.add_argument("--save-chunks", action="store_true",
+                    help="Keep individual chunk PLY files after merge")
+parser.add_argument("--save-boundaries", action="store_true",
+                    help="Save chunk_boundaries.ply with region bounding boxes")
+parser.add_argument("--save-voxel-grid", action="store_true",
+                    help="Save voxel_grid.ply with individual 0.25m fine-cell outlines")
+args = parser.parse_args()
+
 # ── Load config ───────────────────────────────────────────────────────────
-with open("configs/nksr_config.yaml") as f:
+with open(args.config) as f:
     cfg = yaml.safe_load(f)
 
 POINTCLOUD_LAS = cfg['paths']['pointcloud_las']
@@ -495,5 +508,109 @@ o3d.io.write_triangle_mesh(out_path, merged)
 print(f"Saved: {len(merged.vertices):,} vertices, "
       f"{len(merged.triangles):,} faces → {out_path}")
 
-shutil.rmtree(CHUNKS_DIR)
+if args.save_chunks:
+    print(f"Chunk PLYs kept in: {CHUNKS_DIR}")
+else:
+    shutil.rmtree(CHUNKS_DIR)
+
+# ── 10. Optional: chunk boundary wireframe ────────────────────────────────
+if args.save_boundaries:
+    print("Building chunk boundary PLY...")
+    all_points = []
+    all_lines  = []
+    all_colors = []
+    offset = 0
+
+    COMPLEX_COLOR = [1.0, 0.2, 0.2]  # red  — complex regions
+    PLANAR_COLOR  = [0.2, 0.4, 1.0]  # blue — planar regions
+
+    for unit_keys, is_complex in regions:
+        valid_keys = [k for k in unit_keys if k in chunk_data]
+        if not valid_keys:
+            continue
+        all_idx = np.concatenate([chunk_data[k]['indices'] for k in valid_keys])
+        pts_w   = xyz[all_idx] + centroid  # world space
+        bmin    = pts_w.min(axis=0)
+        bmax    = pts_w.max(axis=0)
+
+        x0, y0, z0 = bmin
+        x1, y1, z1 = bmax
+        corners = np.array([
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ])
+        edges = [
+            [offset+0, offset+1], [offset+1, offset+2],
+            [offset+2, offset+3], [offset+3, offset+0],
+            [offset+4, offset+5], [offset+5, offset+6],
+            [offset+6, offset+7], [offset+7, offset+4],
+            [offset+0, offset+4], [offset+1, offset+5],
+            [offset+2, offset+6], [offset+3, offset+7],
+        ]
+        color = COMPLEX_COLOR if is_complex else PLANAR_COLOR
+
+        all_points.append(corners)
+        all_lines.extend(edges)
+        all_colors.extend([color] * 12)
+        offset += 8
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+    ls.lines  = o3d.utility.Vector2iVector(all_lines)
+    ls.colors = o3d.utility.Vector3dVector(all_colors)
+
+    boundary_path = os.path.join(OUTPUT_DIR, "chunk_boundaries.ply")
+    o3d.io.write_line_set(boundary_path, ls)
+    print(f"Chunk boundaries saved → {boundary_path}")
+    print(f"  {sum(1 for _,c in regions if c)} complex (red), "
+          f"{sum(1 for _,c in regions if not c)} planar (blue)")
+
+# ── 11. Optional: fine voxel cell wireframe ───────────────────────────────
+if args.save_voxel_grid:
+    print("Building voxel grid PLY...")
+    all_points = []
+    all_lines  = []
+    all_colors = []
+    offset = 0
+
+    COMPLEX_COLOR = [1.0, 0.2, 0.2]
+    PLANAR_COLOR  = [0.2, 0.4, 1.0]
+
+    for key, data in chunk_data.items():
+        ix, iy, iz = key
+        bmin = np.array([ix,   iy,   iz  ], dtype=np.float32) * FINE_SIZE + centroid
+        bmax = np.array([ix+1, iy+1, iz+1], dtype=np.float32) * FINE_SIZE + centroid
+
+        x0, y0, z0 = bmin
+        x1, y1, z1 = bmax
+        corners = np.array([
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ])
+        edges = [
+            [offset+0, offset+1], [offset+1, offset+2],
+            [offset+2, offset+3], [offset+3, offset+0],
+            [offset+4, offset+5], [offset+5, offset+6],
+            [offset+6, offset+7], [offset+7, offset+4],
+            [offset+0, offset+4], [offset+1, offset+5],
+            [offset+2, offset+6], [offset+3, offset+7],
+        ]
+        color = COMPLEX_COLOR if not data['is_planar'] else PLANAR_COLOR
+
+        all_points.append(corners)
+        all_lines.extend(edges)
+        all_colors.extend([color] * 12)
+        offset += 8
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+    ls.lines  = o3d.utility.Vector2iVector(all_lines)
+    ls.colors = o3d.utility.Vector3dVector(all_colors)
+
+    voxel_path = os.path.join(OUTPUT_DIR, "voxel_grid.ply")
+    o3d.io.write_line_set(voxel_path, ls)
+    print(f"Voxel grid saved → {voxel_path}  ({len(chunk_data):,} cells)")
+    print(f"  {sum(1 for d in chunk_data.values() if not d['is_planar'])} complex (red), "
+          f"{sum(1 for d in chunk_data.values() if d['is_planar'])} planar (blue)")
+
 print(f"\nTotal time: {datetime.now() - start}")
