@@ -4,7 +4,7 @@ import open3d as o3d
 
 rr.init("mesh_viewer", spawn=True)
 
-nksr = o3d.io.read_triangle_mesh("../meshes/nksr_reconstruction_small_scene.ply")
+nksr = o3d.io.read_triangle_mesh("../meshes/crop.ply")
 nksr.compute_vertex_normals()
 
 nksr_vertices = np.asarray(nksr.vertices)
