@@ -249,15 +249,6 @@ for region_keys, is_complex in regions:
                 absorbed_planar_chunks.add(key)
 print(f"Absorbed planar chunks: {len(absorbed_planar_chunks)}")
 
-# Build world-space bboxes for all complex units — used for planar trimming
-complex_bboxes = []
-for region_keys, is_complex in regions:
-    if is_complex:
-        indices = np.concatenate([chunk_data[k]['indices']
-                                   for k in region_keys])
-        pts = xyz[indices]
-        complex_bboxes.append((pts.min(axis=0), pts.max(axis=0)))
-
 print("Growing remaining planar regions (unlimited)...")
 planar_keys = [k for k, v in chunk_data.items()
                if v['is_planar']
@@ -382,17 +373,6 @@ def save_mesh(verts, faces, mesh_obj, label, used_indices=None):
     o3d.io.write_triangle_mesh(chunk_path, chunk_mesh)
     return chunk_path
 
-def mask_planar_verts(verts, core_min_w, core_max_w):
-    """Keep planar mesh vertices that are inside the core bbox and not inside
-    any complex unit's 3D bbox."""
-    in_core = np.all((verts >= core_min_w) & (verts <= core_max_w), axis=1)
-    for cplx_min, cplx_max in complex_bboxes:
-        cplx_min_w = cplx_min + centroid
-        cplx_max_w = cplx_max + centroid
-        in_complex = np.all((verts >= cplx_min_w) & (verts <= cplx_max_w), axis=1)
-        in_core &= ~in_complex
-    return in_core
-
 # ── 8. Reconstruct all units ──────────────────────────────────────────────
 print("\nReconstructing units...")
 
@@ -471,9 +451,12 @@ for unit_idx, (unit_keys, is_complex) in enumerate(regions):
 
         verts, faces, mesh_obj = result
 
+        # Trim back to the core bbox only — this removes exactly the 0.3 m
+        # expansion overlap between adjacent planar regions, without the
+        # complex-bbox subtraction that used to delete whole regions.
         core_min_w = core_min + centroid
         core_max_w = core_max + centroid
-        in_core = mask_planar_verts(verts, core_min_w, core_max_w)
+        in_core = np.all((verts >= core_min_w) & (verts <= core_max_w), axis=1)
         face_mask  = (in_core[faces[:, 0]] &
                       in_core[faces[:, 1]] &
                       in_core[faces[:, 2]])

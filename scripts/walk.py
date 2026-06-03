@@ -1,20 +1,41 @@
-"""First-person hallway walker with chunk streaming.
+"""First-person walkthrough of a large scene with chunk streaming.
 
-Accepts a single large mesh (split spatially on load) or a chunks directory.
-Ground plane is auto-detected; nudge with +/-.
+Input is either a single large mesh (--mesh, split into an XY grid in memory on
+load) or a directory of pre-split chunk PLYs (--chunks-dir). Only chunks within
+--load-radius of the camera are kept in the renderer, so the full scene never
+needs to fit in memory. The ground level is auto-detected (5th-percentile Z) and
+the camera floats --height metres above it; nudge the ground with +/-.
+
+Rendering uses a hidden Open3D window (WGL, works on Windows) blitted into a
+pygame window for input. Click-to-move raycasts against the loaded geometry.
 
 Controls:
     Mouse         : look around
     W / S         : walk forward / back
     A / D         : strafe left / right
-    Left click    : move to clicked point
+    Left click    : move to the clicked point (glides there)
     + / -         : raise / lower ground level by 0.1 m
     Esc           : release mouse (click to re-capture) / quit when released
 
 Usage:
     python scripts/walk.py --mesh ../meshes/scene.ply
     python scripts/walk.py --mesh scene.ply --cell-size 5 --load-radius 12
+    python scripts/walk.py --mesh scene.ply --color          # original vertex colors
     python scripts/walk.py --chunks-dir outputs/chunks
+
+Flags:
+    --mesh FILE        Single large PLY, split into --cell-size m XY cells (xor --chunks-dir)
+    --chunks-dir DIR   Directory of pre-split chunk PLYs                  (xor --mesh)
+    --pattern GLOB     Chunk filter for --chunks-dir (default: *.ply)
+    --cell-size FLOAT  XY grid cell size in m when splitting --mesh (default: 5)
+    --load-radius FLOAT    Load chunks within this distance (m, default: 10)
+    --unload-radius FLOAT  Unload chunks beyond this distance (m, default: 16)
+    --height FLOAT     Eye height above ground (m, default: 1.8)
+    --width / --win-height INT   Window size (default: 1280 x 720)
+    --fov FLOAT        Field of view in degrees (default: 70)
+    --move-speed FLOAT Walk speed m/s (default: 3)
+    --mouse-sens FLOAT Mouse look sensitivity (default: 0.0015)
+    --color            Show original vertex colors instead of uniform grey
 """
 
 import argparse
@@ -43,6 +64,8 @@ parser.add_argument("--win-height",    type=int,   default=720)
 parser.add_argument("--fov",           type=float, default=70.0)
 parser.add_argument("--move-speed",    type=float, default=3.0)
 parser.add_argument("--mouse-sens",    type=float, default=0.0015)
+parser.add_argument("--color", action="store_true",
+                    help="Show original vertex colors instead of uniform grey")
 args = parser.parse_args()
 
 W, H = args.width, args.win_height
@@ -71,7 +94,8 @@ def split_mesh_to_cells(mesh, cell_size):
         if has_vc:
             sub.vertex_colors = o3d.utility.Vector3dVector(colors[used])
         sub.compute_vertex_normals()
-        sub.paint_uniform_color([0.82, 0.82, 0.82])
+        if not (args.color and has_vc):
+            sub.paint_uniform_color([0.82, 0.82, 0.82])
 
         cells.append({
             'key':      f"cell_{key[0]}_{key[1]}",
@@ -136,7 +160,8 @@ def get_mesh(chunk):
     if isinstance(src, str):
         m = o3d.io.read_triangle_mesh(src)
         m.compute_vertex_normals()
-        m.paint_uniform_color([0.82, 0.82, 0.82])
+        if not (args.color and m.has_vertex_colors()):
+            m.paint_uniform_color([0.82, 0.82, 0.82])
         return m
     return src
 

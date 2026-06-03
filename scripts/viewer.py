@@ -1,33 +1,44 @@
 """Render a point cloud or mesh to a PNG with a transparent background.
 
-Accepts point clouds (.ply/.pcd) and triangle meshes (.ply) as --input.
-Overlays (voxel grids, chunk boundaries, extra meshes) can be added with --overlay.
+Accepts point clouds (.ply/.pcd) and triangle meshes (.ply) as --input — the type
+is auto-detected. The background colour is keyed out to alpha, so the PNG has a
+transparent background. Overlays (voxel grids, chunk boundaries, extra meshes) can
+be drawn on top, and normals can be inspected directly.
 
 Usage:
     # Offscreen render → transparent PNG
     python scripts/viewer.py --input cloud.ply
 
-    # Interactive: position camera, press S to save
+    # Interactive: position camera, press S to save (+ optional camera JSON)
     python scripts/viewer.py --input cloud.ply --interactive
 
     # Poster quality, white geometry, 4K
     python scripts/viewer.py --input cloud.ply --color 1 1 1 --bg-color 0 0 0 \
         --width 3840 --height 2160 --point-size 3 --voxel 0.05
 
+    # Keep the file's own colors
+    python scripts/viewer.py --input mesh.ply --original-color --interactive
+
+    # Inspect normals: draw them as lines, or color points by normal direction
+    python scripts/viewer.py --input cloud.ply --show-normals --interactive
+    python scripts/viewer.py --input cloud.ply --color-by-normal --interactive
+
     # Overlay voxel grid in amber, keep camera consistent across renders
     python scripts/viewer.py --input cloud.ply \
         --overlay outputs/voxel_grid.ply outputs/chunk_boundaries.ply \
         --overlay-color 0.9 0.7 0.2 \
         --interactive --save-camera camera.json
-
     python scripts/viewer.py --input cloud.ply --load-camera camera.json
 
 Flags:
     --input FILE            Point cloud or mesh to render (required)
     --output FILE           Output PNG path (default: <input>_render.png)
-    --color R G B           Geometry colour 0-1 (default: 0.85 0.85 0.85)
+    --color R G B           Uniform geometry colour 0-1 (default: 0.85 0.85 0.85)
+    --original-color        Keep the file's own vertex/point colors instead of --color
     --voxel FLOAT           Voxel downsample in metres, point clouds only
     --point-size FLOAT      Rendered point size in pixels (default: 2.0)
+    --show-normals          Draw point normals as lines (estimated if missing)
+    --color-by-normal       Color points by normal direction (xyz->rgb); shows flips
     --width INT             Image width  (default: 1920)
     --height INT            Image height (default: 1080)
     --bg-color R G B        Background colour for keying (default: 0 0 0 black)
@@ -37,6 +48,8 @@ Flags:
     --interactive           Open viewer window; press S to capture, Q to quit
     --save-camera FILE      Save camera to JSON when pressing S
     --load-camera FILE      Restore camera from a previously saved JSON
+
+Color priority: --color-by-normal > --original-color > --color (uniform).
 """
 
 import argparse
@@ -51,10 +64,17 @@ parser.add_argument("--output", default=None,
 parser.add_argument("--color", nargs=3, type=float, default=[0.85, 0.85, 0.85],
                     metavar=("R", "G", "B"),
                     help="Point color in 0-1 range (default: light grey)")
+parser.add_argument("--original-color", action="store_true",
+                    help="Keep the file's original vertex/point colors instead of --color")
 parser.add_argument("--voxel", type=float, default=None,
                     help="Voxel downsample size in metres (default: no downsampling)")
 parser.add_argument("--point-size", type=float, default=2.0,
                     help="Rendered point size in pixels (default: 2.0)")
+parser.add_argument("--show-normals", action="store_true",
+                    help="Draw point normals as short lines (estimates them if missing)")
+parser.add_argument("--color-by-normal", action="store_true",
+                    help="Color each point by its normal direction (xyz->rgb); "
+                         "reveals flipped/inconsistent normals")
 parser.add_argument("--width", type=int, default=1920, help="Image width  (default: 1920)")
 parser.add_argument("--height", type=int, default=1080, help="Image height (default: 1080)")
 parser.add_argument("--bg-color", nargs=3, type=float, default=[0.0, 0.0, 0.0],
@@ -91,7 +111,8 @@ if len(mesh.triangles) > 0:
     mesh.compute_vertex_normals()
     if args.voxel:
         print("  (--voxel ignored for meshes)")
-    mesh.paint_uniform_color(args.color)
+    if not (args.original_color and mesh.has_vertex_colors()):
+        mesh.paint_uniform_color(args.color)
     pcd = mesh
 else:
     pcd = o3d.io.read_point_cloud(args.input)
@@ -99,7 +120,22 @@ else:
     if args.voxel:
         pcd = pcd.voxel_down_sample(args.voxel)
         print(f"  Downsampled to {len(pcd.points):,} points (voxel={args.voxel}m)")
-    pcd.paint_uniform_color(args.color)
+
+    # ── normals visualization ──────────────────────────────────────────────
+    if args.show_normals or args.color_by_normal:
+        if not pcd.has_normals():
+            print("  No normals found — estimating...")
+            pcd.estimate_normals(
+                o3d.geometry.KDTreeSearchParamHybrid(radius=0.1, max_nn=30))
+        else:
+            print("  Using existing normals.")
+
+    if args.color_by_normal:
+        # map normal direction (-1..1 per axis) to RGB (0..1)
+        n = np.asarray(pcd.normals)
+        pcd.colors = o3d.utility.Vector3dVector(np.clip(n * 0.5 + 0.5, 0, 1))
+    elif not (args.original_color and pcd.has_colors()):
+        pcd.paint_uniform_color(args.color)
 
 # ── overlays ──────────────────────────────────────────────────────────────
 overlays = []
@@ -159,6 +195,8 @@ if args.interactive:
     opt = vis.get_render_option()
     opt.background_color = np.array(args.bg_color)
     opt.point_size = args.point_size
+    opt.mesh_show_back_face = True   # NKSR meshes have inconsistent winding
+    opt.point_show_normal = args.show_normals
     vis.reset_view_point(True)
 
     if args.load_camera:
@@ -194,6 +232,8 @@ for ov in overlays:
 opt = vis.get_render_option()
 opt.background_color = np.array(args.bg_color)
 opt.point_size = args.point_size
+opt.mesh_show_back_face = True   # NKSR meshes have inconsistent winding
+opt.point_show_normal = args.show_normals
 
 if args.load_camera:
     params = o3d.io.read_pinhole_camera_parameters(args.load_camera)

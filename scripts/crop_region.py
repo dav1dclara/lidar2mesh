@@ -1,15 +1,28 @@
-"""Crop a region from a large PLY and save it for inspection.
+"""Crop an axis-aligned box from a large PLY and save it for inspection.
 
-Tries to read as mesh first, falls back to point cloud.
-Crop centre defaults to the scene centroid if not specified.
+Reads the file as a mesh first, falls back to a point cloud if it has no faces;
+normals and colors are preserved. The crop is a cube of side 2*--radius centred
+on --center (default: the geometry's centroid). This is non-destructive — the
+source file is never modified. Use --info to just print the bounding box and
+centroid without cropping (handy for picking valid --center coordinates).
 
 Usage:
-    # crop 10m radius around scene centre
+    # print bounding box / centroid, no crop
+    python scripts/crop_region.py --input scene.ply --output unused.ply --info
+
+    # crop a 10 m box around the scene centroid
     python scripts/crop_region.py --input scene.ply --output crop.ply
 
-    # crop around a specific XYZ point
+    # crop an 8 m box (radius 4) around a specific point
     python scripts/crop_region.py --input scene.ply --output crop.ply \
-        --center 123.4 456.7 463.5 --radius 8
+        --center 123.4 456.7 463.5 --radius 4
+
+Flags:
+    --input FILE    Source mesh or point cloud (required)
+    --output FILE   Output PLY (required; ignored with --info)
+    --center X Y Z  Crop-box centre in world coords (default: centroid)
+    --radius FLOAT  Half the box side length in metres (default: 10)
+    --info          Print bounding box / centroid and exit without cropping
 """
 
 import argparse
