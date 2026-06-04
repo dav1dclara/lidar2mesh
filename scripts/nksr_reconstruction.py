@@ -1,3 +1,39 @@
+"""Chunked NKSR surface reconstruction from a large point cloud.
+
+Pipeline:
+  1. Load points (xyz/colors from LAS, normals from PLY, or everything from PLY).
+  2. Voxelize into FINE_SIZE (0.25 m) cells and fit a plane to each cell to
+     classify it planar vs complex (SVD residual).
+  3. Region-grow: complex regions absorb adjacent planar cells; remaining planar
+     cells merge into coplanar regions.
+  4. Reconstruct each region with NKSR — complex at a fine voxel, planar coarser.
+     Planar regions reconstruct on an expanded (overlap) set and are trimmed back
+     to their core bbox. Each region is written as a chunk PLY.
+  5. Stream-merge all chunk PLYs into one binary PLY (one chunk in memory at a
+     time, so the merge never OOMs).
+
+All tunables live in the YAML config (paths, voxel sizes, planarity thresholds,
+per-class reconstruction detail/voxel factors, subsampling caps).
+
+Usage:
+    python scripts/nksr_reconstruction.py
+    python scripts/nksr_reconstruction.py --config configs/nksr_config.yaml
+    python scripts/nksr_reconstruction.py --save-chunks --save-boundaries --save-voxel-grid
+    python scripts/nksr_reconstruction.py --merge-only      # re-merge existing chunks
+
+Flags:
+    --config FILE       Path to YAML config (default: configs/nksr_config.yaml)
+    --save-chunks       Keep the per-region chunk PLYs after merging
+    --save-boundaries   Also write chunk_boundaries.ply (region bbox wireframes,
+                        red=complex / blue=planar)
+    --save-voxel-grid   Also write voxel_grid.ply (0.25 m fine-cell outlines)
+    --merge-only        Skip reconstruction; just stream-merge <output_dir>/chunks
+                        into the output mesh (no GPU, uses config paths)
+
+A timing summary (load / voxelize / SVD / region-grow / reconstruct / merge) is
+printed at the end.
+"""
+
 import os
 import shutil
 import argparse
@@ -22,6 +58,8 @@ parser.add_argument("--save-boundaries", action="store_true",
                     help="Save chunk_boundaries.ply with region bounding boxes")
 parser.add_argument("--save-voxel-grid", action="store_true",
                     help="Save voxel_grid.ply with individual 0.25m fine-cell outlines")
+parser.add_argument("--merge-only", action="store_true",
+                    help="Skip reconstruction; just stream-merge the existing chunks dir")
 args = parser.parse_args()
 
 # ── Load config ───────────────────────────────────────────────────────────
@@ -62,6 +100,88 @@ GPU_DEVICE       = cfg['misc']['gpu_device']
 
 CHUNKS_DIR = os.path.join(OUTPUT_DIR, "chunks")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def stream_merge(chunk_files, out_path, write_color):
+    """Merge chunk PLYs into one binary PLY, one chunk in memory at a time."""
+    print(f"\nMerging {len(chunk_files)} files (streaming)...")
+    vtmp = out_path + ".verts.tmp"
+    ftmp = out_path + ".faces.tmp"
+
+    vdt = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                    ('r', 'u1'), ('g', 'u1'), ('b', 'u1')]) if write_color \
+          else np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
+    fdt = np.dtype([('n', 'u1'), ('a', '<i4'), ('b', '<i4'), ('c', '<i4')])
+
+    total_v = total_f = voff = 0
+    with open(vtmp, 'wb') as vf, open(ftmp, 'wb') as ff:
+        for i, path in enumerate(chunk_files):
+            if (i + 1) % 50 == 0 or i == 0:
+                print(f"  {i+1}/{len(chunk_files)}")
+            m = o3d.io.read_triangle_mesh(path)
+            v = np.asarray(m.vertices, dtype=np.float32)
+            f = np.asarray(m.triangles, dtype=np.int32)
+            if len(v) == 0 or len(f) == 0:
+                del m
+                continue
+
+            vrec = np.empty(len(v), dtype=vdt)
+            vrec['x'], vrec['y'], vrec['z'] = v[:, 0], v[:, 1], v[:, 2]
+            if write_color:
+                if m.has_vertex_colors():
+                    c = (np.clip(np.asarray(m.vertex_colors), 0, 1) * 255).astype(np.uint8)
+                else:
+                    c = np.full((len(v), 3), 200, dtype=np.uint8)
+                vrec['r'], vrec['g'], vrec['b'] = c[:, 0], c[:, 1], c[:, 2]
+            vf.write(vrec.tobytes())
+
+            frec = np.empty(len(f), dtype=fdt)
+            frec['n'] = 3
+            frec['a'], frec['b'], frec['c'] = (f[:, 0] + voff, f[:, 1] + voff, f[:, 2] + voff)
+            ff.write(frec.tobytes())
+
+            voff    += len(v)
+            total_v += len(v)
+            total_f += len(f)
+            del m, v, f, vrec, frec
+
+    header  = "ply\nformat binary_little_endian 1.0\n"
+    header += f"element vertex {total_v}\n"
+    header += "property float x\nproperty float y\nproperty float z\n"
+    if write_color:
+        header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+    header += f"element face {total_f}\n"
+    header += "property list uchar int vertex_indices\nend_header\n"
+
+    with open(out_path, 'wb') as out:
+        out.write(header.encode('ascii'))
+        for tmp in (vtmp, ftmp):
+            with open(tmp, 'rb') as t:
+                shutil.copyfileobj(t, out)
+    os.remove(vtmp)
+    os.remove(ftmp)
+    print(f"Saved: {total_v:,} vertices, {total_f:,} faces → {out_path}")
+
+
+# ── Merge-only mode: stream-merge existing chunks and exit ────────────────
+if args.merge_only:
+    import glob
+    chunk_files = sorted(glob.glob(os.path.join(CHUNKS_DIR, "*.ply")))
+    if not chunk_files:
+        print(f"No chunks found in {CHUNKS_DIR}")
+        raise SystemExit(1)
+    # detect color from the first non-empty chunk
+    write_color = False
+    for p in chunk_files:
+        cm = o3d.io.read_triangle_mesh(p)
+        if len(cm.vertices) > 0:
+            write_color = cm.has_vertex_colors()
+            break
+    out_path = os.path.join(OUTPUT_DIR, OUTPUT_MESH)
+    stream_merge(chunk_files, out_path, write_color)
+    print(f"\nTotal time: {datetime.now() - start}")
+    raise SystemExit(0)
+
 if os.path.exists(CHUNKS_DIR):
     shutil.rmtree(CHUNKS_DIR)
 os.makedirs(CHUNKS_DIR, exist_ok=True)
@@ -477,19 +597,9 @@ for unit_idx, (unit_keys, is_complex) in enumerate(regions):
         if path:
             chunk_files.append(path)
 
-# ── 9. Merge all PLYs ─────────────────────────────────────────────────────
-print(f"\nMerging {len(chunk_files)} files...")
-merged = o3d.geometry.TriangleMesh()
-for i, path in enumerate(chunk_files):
-    print(f"  {i+1}/{len(chunk_files)}: {path}")
-    chunk = o3d.io.read_triangle_mesh(path)
-    merged += chunk
-    del chunk
-
+# ── 9. Merge all PLYs (streaming — one chunk in memory at a time) ──────────
 out_path = os.path.join(OUTPUT_DIR, OUTPUT_MESH)
-o3d.io.write_triangle_mesh(out_path, merged)
-print(f"Saved: {len(merged.vertices):,} vertices, "
-      f"{len(merged.triangles):,} faces → {out_path}")
+stream_merge(chunk_files, out_path, has_color)
 
 if args.save_chunks:
     print(f"Chunk PLYs kept in: {CHUNKS_DIR}")
