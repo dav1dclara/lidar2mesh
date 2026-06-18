@@ -1,5 +1,42 @@
+"""Chunked NKSR surface reconstruction from a large point cloud.
+
+Pipeline:
+  1. Load points (xyz/colors from LAS, normals from PLY, or everything from PLY).
+  2. Voxelize into FINE_SIZE (0.25 m) cells and fit a plane to each cell to
+     classify it planar vs complex (SVD residual).
+  3. Region-grow: complex regions absorb adjacent planar cells; remaining planar
+     cells merge into coplanar regions.
+  4. Reconstruct each region with NKSR — complex at a fine voxel, planar coarser.
+     Planar regions reconstruct on an expanded (overlap) set and are trimmed back
+     to their core bbox. Each region is written as a chunk PLY.
+  5. Stream-merge all chunk PLYs into one binary PLY (one chunk in memory at a
+     time, so the merge never OOMs).
+
+All tunables live in the YAML config (paths, voxel sizes, planarity thresholds,
+per-class reconstruction detail/voxel factors, subsampling caps).
+
+Usage:
+    python scripts/nksr_reconstruction.py
+    python scripts/nksr_reconstruction.py --config configs/nksr_config.yaml
+    python scripts/nksr_reconstruction.py --save-chunks --save-boundaries --save-voxel-grid
+    python scripts/nksr_reconstruction.py --merge-only      # re-merge existing chunks
+
+Flags:
+    --config FILE       Path to YAML config (default: configs/nksr_config.yaml)
+    --save-chunks       Keep the per-region chunk PLYs after merging
+    --save-boundaries   Also write chunk_boundaries.ply (region bbox wireframes,
+                        red=complex / blue=planar)
+    --save-voxel-grid   Also write voxel_grid.ply (0.25 m fine-cell outlines)
+    --merge-only        Skip reconstruction; just stream-merge <output_dir>/chunks
+                        into the output mesh (no GPU, uses config paths)
+
+A timing summary (load / voxelize / SVD / region-grow / reconstruct / merge) is
+printed at the end.
+"""
+
 import os
 import shutil
+import argparse
 import numpy as np
 import torch
 import laspy
@@ -11,13 +48,28 @@ from datetime import datetime
 
 start = datetime.now()
 
+# ── CLI args ──────────────────────────────────────────────────────────────
+parser = argparse.ArgumentParser(description="NKSR chunked reconstruction")
+parser.add_argument("--config", default="configs/nksr_config.yaml",
+                    help="Path to YAML config")
+parser.add_argument("--save-chunks", action="store_true",
+                    help="Keep individual chunk PLY files after merge")
+parser.add_argument("--save-boundaries", action="store_true",
+                    help="Save chunk_boundaries.ply with region bounding boxes")
+parser.add_argument("--save-voxel-grid", action="store_true",
+                    help="Save voxel_grid.ply with individual 0.25m fine-cell outlines")
+parser.add_argument("--merge-only", action="store_true",
+                    help="Skip reconstruction; just stream-merge the existing chunks dir")
+args = parser.parse_args()
+
 # ── Load config ───────────────────────────────────────────────────────────
-with open("configs/nksr_config.yaml") as f:
+with open(args.config) as f:
     cfg = yaml.safe_load(f)
 
 POINTCLOUD_LAS = cfg['paths']['pointcloud_las']
 POINTCLOUD_PLY = cfg['paths']['pointcloud_ply']
 OUTPUT_DIR     = cfg['paths']['output_dir']
+OUTPUT_MESH    = cfg['paths']['output_mesh']
 
 VOXEL_SIZE  = cfg['voxel']['base_size']
 FINE_SIZE   = cfg['voxel']['fine_chunk_size']
@@ -48,34 +100,138 @@ GPU_DEVICE       = cfg['misc']['gpu_device']
 
 CHUNKS_DIR = os.path.join(OUTPUT_DIR, "chunks")
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
+def stream_merge(chunk_files, out_path, write_color):
+    """Merge chunk PLYs into one binary PLY, one chunk in memory at a time."""
+    print(f"\nMerging {len(chunk_files)} files (streaming)...")
+    vtmp = out_path + ".verts.tmp"
+    ftmp = out_path + ".faces.tmp"
+
+    vdt = np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4'),
+                    ('r', 'u1'), ('g', 'u1'), ('b', 'u1')]) if write_color \
+          else np.dtype([('x', '<f4'), ('y', '<f4'), ('z', '<f4')])
+    fdt = np.dtype([('n', 'u1'), ('a', '<i4'), ('b', '<i4'), ('c', '<i4')])
+
+    total_v = total_f = voff = 0
+    with open(vtmp, 'wb') as vf, open(ftmp, 'wb') as ff:
+        for i, path in enumerate(chunk_files):
+            if (i + 1) % 50 == 0 or i == 0:
+                print(f"  {i+1}/{len(chunk_files)}")
+            m = o3d.io.read_triangle_mesh(path)
+            v = np.asarray(m.vertices, dtype=np.float32)
+            f = np.asarray(m.triangles, dtype=np.int32)
+            if len(v) == 0 or len(f) == 0:
+                del m
+                continue
+
+            vrec = np.empty(len(v), dtype=vdt)
+            vrec['x'], vrec['y'], vrec['z'] = v[:, 0], v[:, 1], v[:, 2]
+            if write_color:
+                if m.has_vertex_colors():
+                    c = (np.clip(np.asarray(m.vertex_colors), 0, 1) * 255).astype(np.uint8)
+                else:
+                    c = np.full((len(v), 3), 200, dtype=np.uint8)
+                vrec['r'], vrec['g'], vrec['b'] = c[:, 0], c[:, 1], c[:, 2]
+            vf.write(vrec.tobytes())
+
+            frec = np.empty(len(f), dtype=fdt)
+            frec['n'] = 3
+            frec['a'], frec['b'], frec['c'] = (f[:, 0] + voff, f[:, 1] + voff, f[:, 2] + voff)
+            ff.write(frec.tobytes())
+
+            voff    += len(v)
+            total_v += len(v)
+            total_f += len(f)
+            del m, v, f, vrec, frec
+
+    header  = "ply\nformat binary_little_endian 1.0\n"
+    header += f"element vertex {total_v}\n"
+    header += "property float x\nproperty float y\nproperty float z\n"
+    if write_color:
+        header += "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+    header += f"element face {total_f}\n"
+    header += "property list uchar int vertex_indices\nend_header\n"
+
+    with open(out_path, 'wb') as out:
+        out.write(header.encode('ascii'))
+        for tmp in (vtmp, ftmp):
+            with open(tmp, 'rb') as t:
+                shutil.copyfileobj(t, out)
+    os.remove(vtmp)
+    os.remove(ftmp)
+    print(f"Saved: {total_v:,} vertices, {total_f:,} faces → {out_path}")
+
+
+# ── Merge-only mode: stream-merge existing chunks and exit ────────────────
+if args.merge_only:
+    import glob
+    chunk_files = sorted(glob.glob(os.path.join(CHUNKS_DIR, "*.ply")))
+    if not chunk_files:
+        print(f"No chunks found in {CHUNKS_DIR}")
+        raise SystemExit(1)
+    # detect color from the first non-empty chunk
+    write_color = False
+    for p in chunk_files:
+        cm = o3d.io.read_triangle_mesh(p)
+        if len(cm.vertices) > 0:
+            write_color = cm.has_vertex_colors()
+            break
+    out_path = os.path.join(OUTPUT_DIR, OUTPUT_MESH)
+    stream_merge(chunk_files, out_path, write_color)
+    print(f"\nTotal time: {datetime.now() - start}")
+    raise SystemExit(0)
+
 if os.path.exists(CHUNKS_DIR):
     shutil.rmtree(CHUNKS_DIR)
 os.makedirs(CHUNKS_DIR, exist_ok=True)
 
 # ── 1. Load point cloud ───────────────────────────────────────────────────
 print("Loading point cloud...")
-las = laspy.read(POINTCLOUD_LAS)
-xyz = np.vstack([las.x, las.y, las.z]).T.astype(np.float32)
+if POINTCLOUD_LAS:
+    las = laspy.read(POINTCLOUD_LAS)
+    xyz = np.vstack([las.x, las.y, las.z]).T  # float64 for precision
 
-if hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue'):
-    colors = np.vstack([las.red, las.green, las.blue]).T.astype(np.float32)
-    colors /= 65535.0
-    has_color = True
-    print("Color data found.")
+    if hasattr(las, 'red') and hasattr(las, 'green') and hasattr(las, 'blue'):
+        colors = np.vstack([las.red, las.green, las.blue]).T.astype(np.float32)
+        colors /= 65535.0
+        has_color = True
+        print("Color data found.")
+    else:
+        has_color = False
+        print("No color data found.")
+
+    centroid = xyz.mean(axis=0)
+    xyz -= centroid
+    xyz = xyz.astype(np.float32)
+
+    print(f"Loaded {len(xyz):,} points.")
+    print("Loading normals from PLY...")
+    pcd = o3d.io.read_point_cloud(POINTCLOUD_PLY)
+    normals = np.asarray(pcd.normals).astype(np.float32)
+    del pcd
+    print("Normals loaded.")
 else:
-    has_color = False
-    print("No color data found.")
+    print("No LAS file configured — loading XYZ, normals and colors from PLY...")
+    pcd = o3d.io.read_point_cloud(POINTCLOUD_PLY)
+    xyz = np.asarray(pcd.points)  # float64
 
-centroid = xyz.mean(axis=0)
-xyz -= centroid
-print(f"Loaded {len(xyz):,} points.")
+    centroid = xyz.mean(axis=0)
+    xyz -= centroid
+    xyz = xyz.astype(np.float32)
 
-# ── 2. Load normals from PLY ──────────────────────────────────────────────
-print("Loading normals from PLY...")
-pcd = o3d.io.read_point_cloud(POINTCLOUD_PLY)
-normals = np.asarray(pcd.normals).astype(np.float32)
-del pcd
-print("Normals loaded.")
+    normals = np.asarray(pcd.normals).astype(np.float32)
+
+    if pcd.has_colors():
+        colors = np.asarray(pcd.colors).astype(np.float32)
+        has_color = True
+        print("Color data found.")
+    else:
+        has_color = False
+        print("No color data found.")
+
+    del pcd
+    print(f"Loaded {len(xyz):,} points.")
 
 # ── 3. Assign points to fine chunks ───────────────────────────────────────
 print("Assigning points to fine chunks...")
@@ -124,6 +280,9 @@ for key, indices in point_chunks.items():
 n_planar  = sum(1 for c in chunk_data.values() if c['is_planar'])
 n_complex = sum(1 for c in chunk_data.values() if not c['is_planar'])
 print(f"Planar chunks: {n_planar}, Complex chunks: {n_complex}")
+residuals = np.array([c['residual'] for c in chunk_data.values()])
+for pct in [50, 75, 90, 95, 99, 100]:
+    print(f"  residual p{pct}: {np.percentile(residuals, pct):.4f}")
 
 # ── 5. Neighbours ─────────────────────────────────────────────────────────
 def get_neighbours(key):
@@ -134,7 +293,8 @@ def get_neighbours(key):
         (ix, iy, iz+1), (ix, iy, iz-1),
     ]
 
-MAX_EXTENT_CHUNKS = int(COMPLEX_MAX_EXTENT_M / FINE_SIZE)
+MAX_EXTENT_CHUNKS  = int(COMPLEX_MAX_EXTENT_M / FINE_SIZE)
+COMPLEX_MAX_PTS    = cfg['reconstruction']['complex_max_pts']
 
 # ── 6. Region growing ─────────────────────────────────────────────────────
 print("Growing complex regions (absorbing adjacent planar)...")
@@ -147,10 +307,11 @@ for start_key in complex_keys:
     if start_key in visited:
         continue
 
-    region   = []
-    queue    = [start_key]
-    bbox_min = np.array(start_key)
-    bbox_max = np.array(start_key)
+    region    = []
+    queue     = [start_key]
+    bbox_min  = np.array(start_key)
+    bbox_max  = np.array(start_key)
+    total_pts = 0
 
     while queue:
         key = queue.pop()
@@ -169,8 +330,12 @@ for start_key in complex_keys:
             bbox_min = new_min
             bbox_max = new_max
 
+        if total_pts + cur['n_pts'] > COMPLEX_MAX_PTS:
+            continue
+
         visited.add(key)
         region.append(key)
+        total_pts += cur['n_pts']
 
         for nb_key in get_neighbours(key):
             if nb_key in visited or nb_key not in chunk_data:
@@ -203,15 +368,6 @@ for region_keys, is_complex in regions:
             if chunk_data[key]['is_planar']:
                 absorbed_planar_chunks.add(key)
 print(f"Absorbed planar chunks: {len(absorbed_planar_chunks)}")
-
-# Build world-space bboxes for all complex units — used for planar trimming
-complex_bboxes = []
-for region_keys, is_complex in regions:
-    if is_complex:
-        indices = np.concatenate([chunk_data[k]['indices']
-                                   for k in region_keys])
-        pts = xyz[indices]
-        complex_bboxes.append((pts.min(axis=0), pts.max(axis=0)))
 
 print("Growing remaining planar regions (unlimited)...")
 planar_keys = [k for k, v in chunk_data.items()
@@ -262,6 +418,7 @@ chunk_files   = []
 chunk_counter = [0]
 
 def run_nksr(pts_np, nrm_np, clr_np, detail, mise, vox_size):
+    global reconstructor
     chunk_pts = torch.from_numpy(pts_np).float().cuda()
     chunk_nrm = torch.from_numpy(nrm_np).float().cuda()
     chunk_clr = (torch.from_numpy(clr_np).float().cuda()
@@ -283,11 +440,20 @@ def run_nksr(pts_np, nrm_np, clr_np, detail, mise, vox_size):
         if len(verts) == 0 or len(faces) == 0:
             return None
         return verts, faces, mesh
-    except (torch.cuda.OutOfMemoryError, AttributeError, RuntimeError) as e:
-        print(f"      NKSR failed: {e}")
-        return None
-    finally:
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"      NKSR OOM: {e}")
         torch.cuda.empty_cache()
+        return None
+    except (AttributeError, RuntimeError) as e:
+        print(f"      NKSR failed: {e}")
+        # Fatal CUDA errors corrupt the device context — reinitialize to recover
+        try:
+            torch.cuda.empty_cache()
+            reconstructor = nksr.Reconstructor(torch.device(GPU_DEVICE))
+            print("      Reconstructor reinitialized.")
+        except Exception as reinit_err:
+            print(f"      Reinit failed: {reinit_err}")
+        return None
 
 def smart_subsample(pts_np, nrm_np, clr_np, max_pts, vox_size):
     if len(pts_np) <= max_pts:
@@ -326,27 +492,6 @@ def save_mesh(verts, faces, mesh_obj, label, used_indices=None):
     chunk_counter[0] += 1
     o3d.io.write_triangle_mesh(chunk_path, chunk_mesh)
     return chunk_path
-
-def compute_planar_trim_bbox(core_min, core_max):
-    """Trim planar mesh to exclude areas covered by complex units."""
-    trim_min = core_min.copy()
-    trim_max = core_max.copy()
-
-    for cplx_min, cplx_max in complex_bboxes:
-        for axis in range(3):
-            span = core_max[axis] - core_min[axis]
-
-            # Complex unit overlaps our low end on this axis
-            overlap_lo = cplx_max[axis] - core_min[axis]
-            if 0 < overlap_lo < span:
-                trim_min[axis] = max(trim_min[axis], cplx_max[axis])
-
-            # Complex unit overlaps our high end on this axis
-            overlap_hi = core_max[axis] - cplx_min[axis]
-            if 0 < overlap_hi < span:
-                trim_max[axis] = min(trim_max[axis], cplx_min[axis])
-
-    return trim_min, trim_max
 
 # ── 8. Reconstruct all units ──────────────────────────────────────────────
 print("\nReconstructing units...")
@@ -426,12 +571,12 @@ for unit_idx, (unit_keys, is_complex) in enumerate(regions):
 
         verts, faces, mesh_obj = result
 
-        # Trim planar mesh — exclude areas covered by complex units
-        trim_min, trim_max = compute_planar_trim_bbox(core_min, core_max)
-        trim_min_w = trim_min + centroid
-        trim_max_w = trim_max + centroid
-
-        in_core  = np.all((verts >= trim_min_w) & (verts <= trim_max_w), axis=1)
+        # Trim back to the core bbox only — this removes exactly the 0.3 m
+        # expansion overlap between adjacent planar regions, without the
+        # complex-bbox subtraction that used to delete whole regions.
+        core_min_w = core_min + centroid
+        core_max_w = core_max + centroid
+        in_core = np.all((verts >= core_min_w) & (verts <= core_max_w), axis=1)
         face_mask  = (in_core[faces[:, 0]] &
                       in_core[faces[:, 1]] &
                       in_core[faces[:, 2]])
@@ -452,18 +597,113 @@ for unit_idx, (unit_keys, is_complex) in enumerate(regions):
         if path:
             chunk_files.append(path)
 
-# ── 9. Merge all PLYs ─────────────────────────────────────────────────────
-print(f"\nMerging {len(chunk_files)} files...")
-merged = o3d.geometry.TriangleMesh()
-for i, path in enumerate(chunk_files):
-    print(f"  {i+1}/{len(chunk_files)}: {path}")
-    chunk = o3d.io.read_triangle_mesh(path)
-    merged += chunk
-    del chunk
+# ── 9. Merge all PLYs (streaming — one chunk in memory at a time) ──────────
+out_path = os.path.join(OUTPUT_DIR, OUTPUT_MESH)
+stream_merge(chunk_files, out_path, has_color)
 
-out_path = os.path.join(OUTPUT_DIR, "nksr_reconstruction.ply")
-o3d.io.write_triangle_mesh(out_path, merged)
-print(f"Saved: {len(merged.vertices):,} vertices, "
-      f"{len(merged.triangles):,} faces → {out_path}")
+if args.save_chunks:
+    print(f"Chunk PLYs kept in: {CHUNKS_DIR}")
+else:
+    shutil.rmtree(CHUNKS_DIR)
+
+# ── 10. Optional: chunk boundary wireframe ────────────────────────────────
+if args.save_boundaries:
+    print("Building chunk boundary PLY...")
+    all_points = []
+    all_lines  = []
+    all_colors = []
+    offset = 0
+
+    COMPLEX_COLOR = [1.0, 0.2, 0.2]  # red  — complex regions
+    PLANAR_COLOR  = [0.2, 0.4, 1.0]  # blue — planar regions
+
+    for unit_keys, is_complex in regions:
+        valid_keys = [k for k in unit_keys if k in chunk_data]
+        if not valid_keys:
+            continue
+        all_idx = np.concatenate([chunk_data[k]['indices'] for k in valid_keys])
+        pts_w   = xyz[all_idx] + centroid  # world space
+        bmin    = pts_w.min(axis=0)
+        bmax    = pts_w.max(axis=0)
+
+        x0, y0, z0 = bmin
+        x1, y1, z1 = bmax
+        corners = np.array([
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ])
+        edges = [
+            [offset+0, offset+1], [offset+1, offset+2],
+            [offset+2, offset+3], [offset+3, offset+0],
+            [offset+4, offset+5], [offset+5, offset+6],
+            [offset+6, offset+7], [offset+7, offset+4],
+            [offset+0, offset+4], [offset+1, offset+5],
+            [offset+2, offset+6], [offset+3, offset+7],
+        ]
+        color = COMPLEX_COLOR if is_complex else PLANAR_COLOR
+
+        all_points.append(corners)
+        all_lines.extend(edges)
+        all_colors.extend([color] * 12)
+        offset += 8
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+    ls.lines  = o3d.utility.Vector2iVector(all_lines)
+    ls.colors = o3d.utility.Vector3dVector(all_colors)
+
+    boundary_path = os.path.join(OUTPUT_DIR, "chunk_boundaries.ply")
+    o3d.io.write_line_set(boundary_path, ls)
+    print(f"Chunk boundaries saved → {boundary_path}")
+    print(f"  {sum(1 for _,c in regions if c)} complex (red), "
+          f"{sum(1 for _,c in regions if not c)} planar (blue)")
+
+# ── 11. Optional: fine voxel cell wireframe ───────────────────────────────
+if args.save_voxel_grid:
+    print("Building voxel grid PLY...")
+    all_points = []
+    all_lines  = []
+    all_colors = []
+    offset = 0
+
+    COMPLEX_COLOR = [1.0, 0.2, 0.2]
+    PLANAR_COLOR  = [0.2, 0.4, 1.0]
+
+    for key, data in chunk_data.items():
+        ix, iy, iz = key
+        bmin = np.array([ix,   iy,   iz  ], dtype=np.float32) * FINE_SIZE + centroid
+        bmax = np.array([ix+1, iy+1, iz+1], dtype=np.float32) * FINE_SIZE + centroid
+
+        x0, y0, z0 = bmin
+        x1, y1, z1 = bmax
+        corners = np.array([
+            [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+            [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+        ])
+        edges = [
+            [offset+0, offset+1], [offset+1, offset+2],
+            [offset+2, offset+3], [offset+3, offset+0],
+            [offset+4, offset+5], [offset+5, offset+6],
+            [offset+6, offset+7], [offset+7, offset+4],
+            [offset+0, offset+4], [offset+1, offset+5],
+            [offset+2, offset+6], [offset+3, offset+7],
+        ]
+        color = COMPLEX_COLOR if not data['is_planar'] else PLANAR_COLOR
+
+        all_points.append(corners)
+        all_lines.extend(edges)
+        all_colors.extend([color] * 12)
+        offset += 8
+
+    ls = o3d.geometry.LineSet()
+    ls.points = o3d.utility.Vector3dVector(np.vstack(all_points))
+    ls.lines  = o3d.utility.Vector2iVector(all_lines)
+    ls.colors = o3d.utility.Vector3dVector(all_colors)
+
+    voxel_path = os.path.join(OUTPUT_DIR, "voxel_grid.ply")
+    o3d.io.write_line_set(voxel_path, ls)
+    print(f"Voxel grid saved → {voxel_path}  ({len(chunk_data):,} cells)")
+    print(f"  {sum(1 for d in chunk_data.values() if not d['is_planar'])} complex (red), "
+          f"{sum(1 for d in chunk_data.values() if d['is_planar'])} planar (blue)")
 
 print(f"\nTotal time: {datetime.now() - start}")
