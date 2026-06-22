@@ -1,304 +1,178 @@
 # REPO_GUIDE.md
 
-Onboarding guide for the ETH Zurich 3D Vision project **"LiDAR to Mesh using Neural Kernel Surface Reconstruction"**. Written for someone with general ML/CV background who has not seen this code. Cross-referenced against [`Proposal.pdf`](Proposal.pdf).
-
-> Conventions: file/function references are clickable relative links like [`scripts/nksr_reconstruction.py`](scripts/nksr_reconstruction.py). Claims I could not verify from code alone are marked **(unclear — verify with team)**.
+Methodological guide to the ETH Zurich 3D Vision project **"LiDAR to Mesh using Neural Kernel Surface Reconstruction"**. The focus here is on *why the pipeline is built the way it is* — the design decisions, their rationale, and their trade-offs — not on code structure. Implementation specifics (line numbers, function names) are deliberately omitted.
 
 ---
 
-## 1. What this repo does
+## 1. Problem framing
 
-The project converts large-scale **indoor LiDAR point clouds** captured with a **NavVis VLX** mobile mapping scanner (building-scale, millions of points, uneven density, occlusions) into **explicit triangle meshes**. The core meshing method is **Neural Kernel Surface Reconstruction (NKSR)** — a learned-kernel implicit surface method designed to scale to large, noisy point clouds. The two research questions from the proposal are (1) **scalability** of NKSR to building-scale scans within practical runtime/memory, and (2) **quality/robustness** versus classical TSDF-style baselines.
+The goal is to turn a building-scale indoor **NavVis VLX** LiDAR scan (millions of points, uneven density, occlusions, no ground-truth mesh) into a single colored triangle mesh, using **Neural Kernel Surface Reconstruction (NKSR)** as the core mesher. The two research questions are **(RQ1) scalability** of NKSR to whole-building scans and **(RQ2) reconstruction quality/robustness** versus classical baselines.
 
-The main contribution in this repo is *not* re-implementing NKSR but wrapping it in a **geometry-aware chunking pipeline** so it can run on a whole building scan. The scene is split into fine voxels, each voxel is classified planar vs. complex via PCA/SVD, and chunks are merged by **region growing**: complex regions (furniture, objects) grow first and absorb adjacent flat walls/floors so NKSR always sees full context at edges; leftover flat chunks form their own coarse, cheap reconstruction units. Each unit is reconstructed by NKSR at an adaptive resolution and the per-unit meshes are merged into one PLY.
+NKSR is a learned implicit-surface method: from oriented points it predicts compactly-supported kernels on a sparse voxel hierarchy, solves a sparse linear system for an implicit field, and extracts a dual mesh. It is accurate but its memory and runtime scale with the number of points and the reconstructed volume — so a whole building **cannot** be reconstructed in a single call on one GPU. Everything interesting in this repo is the strategy that makes NKSR usable at building scale while keeping quality high. That strategy is the subject of §3–§5.
 
-Alongside the NKSR pipeline there are **baseline reconstructors** (VDBFusion = TSDF fusion + Marching Cubes; Screened Poisson; a Delaunay/visibility block mesher via `pcdmeshing`) and a standalone **mesh quality-assessment** tool (Tkinter GUI + metrics library) that compares a reconstructed mesh against the source point cloud (used as a pseudo-ground-truth, since no true ground truth exists — see proposal §5).
-
-> **Important gap vs. proposal:** the proposal repeatedly centers the contribution on integrating NKSR with **fVDB** sparse voxel grids for chunked processing. In the current code there is **no fVDB usage** — chunking is done with a custom NumPy/dict region-growing scheme, and NKSR's own internal sparse structure does the rest. See §8 and §11.
+> **Largest divergence from the proposal:** the proposal's headline contribution was integrating NKSR with **fVDB** sparse voxel grids for chunked processing. The current code uses **no fVDB at all** — the chunking is a custom geometry-aware scheme described below. Whether fVDB is still in scope is the single most important open question (§8).
 
 ---
 
-## 2. Pipeline overview
+## 2. Why the obvious approaches don't work
 
-```mermaid
-flowchart TD
-    A["NavVis VLX scan<br/>(cleaned in NavVis software, off-repo)"] -->|"pointcloud.las (xyz+RGB)<br/>pointcloud.ply (xyz+normals)"| B
+Two naive ways to scale NKSR to a building, and why they were rejected — this motivates the whole design:
 
-    subgraph NKSR["NKSR main pipeline — scripts/nksr_reconstruction.py"]
-      B["Load LAS xyz+colors, PLY normals<br/>center on centroid"] --> C["Assign points to fine voxels<br/>FINE_SIZE grid"]
-      C --> D["Per-voxel plane fit (SVD)<br/>planar vs complex"]
-      D --> E["Region growing:<br/>complex-first absorb planar,<br/>then leftover planar units"]
-      E --> F["Per-unit NKSR reconstruct<br/>adaptive detail/voxel<br/>+ optional color field"]
-      F --> G["Trim planar overlaps,<br/>save per-chunk PLY"]
-      G --> H["Merge chunks ->\noutputs/nksr_reconstruction.ply"]
-    end
+- **Single global reconstruction.** Out of memory. NKSR's cost grows with point count and volume; a full scan exceeds GPU memory.
+- **Regular-grid chunking** (split the scene into uniform boxes, reconstruct each, stitch). Two failure modes:
+  1. **Seams fall in the worst places.** A regular grid cuts arbitrarily through surfaces and, critically, through *object–wall transitions* (a chair where it meets the floor). Reconstructing the two sides independently produces mismatched surfaces and visible stitching artifacts exactly where geometry is most delicate.
+  2. **Uniform resolution is wasteful.** A flat wall and an intricate chair are reconstructed at the same (high) resolution. Most of an indoor scene is flat — so most of the compute is spent over-resolving surfaces that a coarse mesh would capture perfectly.
 
-    A -->|pointcloud.las| I["VDBFusion (TSDF+MC)<br/>scripts/vdbfusion_reconstruction.py"]
-    A -->|pointcloud.ply| J["Screened Poisson<br/>scripts/poisson_meshing.py"]
-    A -->|pointcloud.ply| K["Block Delaunay mesher<br/>scripts/pcd_meshing.py"]
-    I --> L["outputs/vdbfusion_reconstruction.ply/.vdb"]
-    J --> M["outputs/poisson_reconstruction.ply"]
-    K --> N["outputs/pcd_reconstruction.ply"]
-
-    H --> O["Quality assessment<br/>src/quality_assessment.py<br/>scripts/run_quality_assessment.py (GUI)"]
-    L --> O
-    M --> O
-    N --> O
-    A -->|"source PLY as pseudo-GT"| O
-    H --> P["Visual compare<br/>scripts/view_mesh.py (rerun)"]
-    M --> P
-    N --> P
-```
+The pipeline is engineered specifically to avoid both. The central idea: **decompose the scene by geometric difficulty rather than by a fixed grid, so that (a) hard regions are reconstructed together with their surrounding context, and (b) the seams that remain fall on flat, easy surfaces where they can be trimmed cleanly.**
 
 ---
 
-## 3. Directory structure
+## 3. The main pipeline — methodological choices
 
-```
-3d-vision/
-├── Proposal.pdf                 Project proposal (read for research goals/RQs)
-├── README.md                    Setup + NKSR/VDBFusion run instructions (partly stale — see §8)
-├── REPO_GUIDE.md                This document
-├── pyproject.toml               Installs src/ as the `3d_vision` package (setuptools)
-├── requirements.txt             Conda explicit env dump — MISSING torch/nksr/fvdb/vdbfusion (see §5)
-├── .pre-commit-config.yaml      Formatting/lint hooks (run via `pre-commit install`)
-├── configs/                     YAML configs, one per reconstructor (+ a stale testing config)
-├── scripts/                     All runnable entry points (pipeline + baselines + tools)
-├── src/
-│   ├── 3d_vision/__init__.py    Empty package marker (the installed package; effectively unused)
-│   └── quality_assessment.py    Metrics library (distance, F-score, residual dist, Plotly viz)
-└── docs/quality_assessment/     README + minimal requirements for the QA tool
-```
+The pipeline is: classify local geometry → group into reconstruction units by difficulty → reconstruct each unit adaptively → merge. Each step below is a deliberate methodological decision, given with its rationale and trade-off.
 
-There is no `outputs/`, `data/`, or `results/` in git (`.gitignore` excludes `outputs/`); these are created at runtime. Input data lives outside the repo on the HPC filesystem / Google Drive (see §6).
+### 3.1 Local geometry classification: planar vs. complex
+The scene is first partitioned into fine voxel cells (0.25 m), and each cell is classified as **planar** or **complex** by fitting a plane with SVD and taking the ratio of the smallest to largest singular value as a normalized **planarity residual** (≈0 means the points lie in a plane).
 
----
+- **Why classify at all:** indoor scenes are dominated by large flat surfaces (walls, floors, ceilings) that are *easy* to reconstruct, punctuated by *hard* complex geometry (furniture, objects, people). Treating these two classes differently is what enables both the quality and the efficiency wins downstream.
+- **Why a singular-value ratio:** it is scale- and density-normalized, so a single global threshold (`residual_threshold`, default 0.1) behaves consistently across the scene regardless of how many points a cell holds.
+- **Why 0.25 m cells:** small enough to localize where geometry is complex, large enough to contain a statistically meaningful plane fit (cells below `min_points_per_chunk`, default 20, are ignored as noise).
+- **Trade-off:** the threshold is global and hand-tuned. Cells near the boundary (textured walls, gentle curves) are sensitive to it; too low over-classifies as complex (slow), too high misses real detail. This is the dominant quality/runtime lever and a natural place for the RQ1/RQ2 sensitivity study.
 
-## 4. Script-by-script breakdown
+### 3.2 Complex-first region growing with planar absorption
+This is the **core methodological insight** of the project. Complex cells grow into reconstruction units first (breadth-first), and as a complex region grows it **greedily absorbs every adjacent cell, including flat ones**.
 
-### Stage A — Data loading & preprocessing
-Performed *inside* each reconstruction script (no shared data-loading module). NavVis-side cleaning happens off-repo in NavVis software (proposal §4.2). Boundary formats:
-- `pointcloud.las` — xyz + 16-bit RGB (`las.red/green/blue`, scaled by `/65535`).
-- `pointcloud.ply` — xyz + **precomputed normals** (NavVis-exported; read via Open3D `pcd.normals`). Normals are *not* re-estimated — see README "Normals from PLY".
+- **Why complex regions absorb their flat surroundings:** the hardest part of reconstruction is the *transition* between an object and the surface it rests on. If a complex region carries the surrounding wall/floor into the *same* NKSR call, the network sees the full context of every edge and produces a clean, continuous transition — no stitching. This is precisely the seam-placement problem from §2, solved by construction.
+- **Why complex-first (priority):** complex geometry dictates where the difficult seams are, so it claims territory first; flat surfaces are subordinate context.
+- **Bounded growth for memory:** complex-to-complex growth is capped by spatial extent (`complex_max_extent_m`, default 2 m) and every unit is capped by point count (`complex_max_pts`, default 1 M). These caps are the explicit knob that keeps each unit within GPU memory — the scalability mechanism. Note the asymmetry: only complex-to-complex expansion counts against the extent cap; absorbed flat context can extend beyond it, because context is cheap and valuable.
+- **Trade-off / risk:** when a large complex region hits the point/extent cap it stops, and the remaining complex cells form a *separate* unit. Because complex units are deliberately **not** trimmed (see §3.4), two adjacent complex units can then overlap at their shared boundary (double surfaces / z-fighting). The design trades a possible seam *between complex units* (rare, on genuinely large objects) for guaranteed-clean object–wall transitions (common). Worth measuring how often the cap actually splits a region.
 
-### Stage B — NKSR main pipeline (the core deliverable)
+### 3.3 Leftover flat surfaces: coplanar planar units
+Flat cells never absorbed by any complex region are grown into their own **planar-only** units. Here growth is gated by **two** predicates: normals must be similar (`angle_threshold_deg`, 15°) **and** the cells must be genuinely coplanar (mean point-to-plane distance below `coplanar_dist_threshold`, 0.1 m).
 
-[`scripts/nksr_reconstruction.py`](scripts/nksr_reconstruction.py) (468 lines, top-level script, no `__main__` guard, **must be run from repo root** because it opens `configs/nksr_config.yaml` by relative path).
+- **Why both predicates:** two parallel walls have nearly identical normals but different plane offsets. Normal-similarity alone would merge them into one unit; the coplanarity (offset) test prevents that, so a unit corresponds to a single physical surface.
+- **Why separate units for flat regions:** they can be reconstructed far more cheaply than complex ones (§3.4), and keeping them apart from complex units is what lets the system spend its compute budget where it matters.
 
-- **Inputs:** `pointcloud_las` (xyz+color), `pointcloud_ply` (normals), all paths/params from [`configs/nksr_config.yaml`](configs/nksr_config.yaml).
-- **Output:** `outputs/nksr_reconstruction.ply` (merged colored mesh) + per-unit PLYs in `outputs/chunks/` (wiped at start).
-- Key functions:
-  - `fit_plane(pts)` (line 90) — SVD plane fit; `residual = s[-1]/s[0]` is the planarity score (small ⇒ flat).
-  - `normals_similar` (line 98), `planes_coplanar` (line 102) — merge predicates for planar region growing.
-  - `get_neighbours` (line 129) — 6-connected voxel neighbours.
-  - Region growing: complex-first BFS with extent cap `MAX_EXTENT_CHUNKS` (lines 140–196), then unlimited planar growing (lines 216–253). Produces `regions = [(keys, is_complex), ...]`.
-  - `run_nksr(pts, nrm, clr, detail, mise, vox_size)` (line 264) — moves arrays to CUDA, calls `nksr.Reconstructor.reconstruct(...)`, optionally attaches `nksr.fields.PCNNField` color texture, extracts mesh via `field.extract_dual_mesh(mise_iter=...)`. Catches CUDA OOM / RuntimeError and returns `None`.
-  - `smart_subsample` (line 292) — Open3D voxel downsample loop until ≤ `PLANAR_MAX_PTS` (planar units only).
-  - `save_mesh` (line 314) — writes a per-unit PLY with optional vertex colors.
-  - `compute_planar_trim_bbox` (line 330) — shrinks a planar unit's bbox away from any complex unit's bbox so planar and complex meshes don't overlap.
-  - Reconstruction loop (lines 354–453): complex units use `COMPLEX_*` params (high detail, fine voxel, no trim); planar units expand by `PLANAR_OVERLAP_M`, subsample, reconstruct at coarse detail, then trim against complex bboxes and remap faces.
-  - Merge (lines 456–467): `o3d` concatenation of all chunk PLYs.
-- **Calls:** `nksr`, `torch`, `laspy`, `open3d`, `numpy`, `yaml`. **Called by:** nothing (manual `python scripts/nksr_reconstruction.py`).
+### 3.4 Adaptive resolution per unit class
+Each unit is reconstructed by NKSR at a resolution matched to its difficulty:
+- **Complex units:** highest detail, finest voxel — full fidelity for furniture/objects.
+- **Planar units, tiered:** "very flat" surfaces (residual below `planar_very_flat_threshold`) use the coarsest voxel and lowest detail; merely "flat" surfaces use an intermediate setting.
 
-[`scripts/testing_nksr_recon.py`](scripts/testing_nksr_recon.py) — **currently byte-identical** to `nksr_reconstruction.py` (verified via `diff`: IDENTICAL). Historically a divergent experimental fork (was `nksr_fvdb_recon.py`); it has since converged. Treat as redundant / dead duplicate — **(verify with team whether this should be deleted or is a placeholder for experiments)**.
+- **Why adaptive:** flat surfaces reconstruct correctly at low resolution, so resolving them finely buys nothing but GPU time. Spending the resolution budget only where curvature/detail exists is the efficiency half of the §2 motivation. The tiering even within planar reflects that a pristine wall can go coarser than a slightly textured one.
+- **Trade-off:** the per-class parameters are hand-set, not derived. They encode an assumption that "flat ⇒ low frequency" which holds for walls/floors but could under-resolve flat-but-detailed surfaces (e.g. a flat panel with fine relief).
 
-### Stage C — Baselines
+### 3.5 Asymmetric overlap-and-trim at unit boundaries
+How adjacent units are kept consistent differs by class, on purpose:
+- **Planar units** are reconstructed on an **expanded** point set (core bounding box plus an overlap margin, `planar_overlap_m`, 0.3 m), then the resulting mesh is **trimmed back to the core box**. The overlap gives NKSR enough context that the implicit field doesn't fall off at the unit edge; trimming to the core ensures neighbouring planar units meet without double-covering.
+- **Complex units** are **never trimmed** — they are meant to *win* every transition zone they cover.
 
-[`scripts/vdbfusion_reconstruction.py`](scripts/vdbfusion_reconstruction.py) — **TSDF fusion + Marching Cubes baseline** (proposal's "TSDF-based reconstruction using Marching Cubes"). Driven by [`configs/vdbfusion_config.yaml`](configs/vdbfusion_config.yaml).
-- `build_points(las_path, downsample_voxel)` (line 14) — loads LAS, drops non-finite, optional Open3D downsample.
-- `reconstruct_once(...)` (line 40) — builds a `vdbfusion.VDBVolume`, `integrate()`s the whole cloud from a single fixed sensor origin (`static_mode.fixed_origin`), extracts a `.vdb` grid and a triangle mesh, writes `.ply` + `.vdb`.
-- `write_ply_uint` (line 118) — alternative `plyfile`-based writer (currently commented out at the call site, line 109).
-- `main()` (line 138) — supports a **parameter sweep** (`sweep.enabled`) over `downsample_voxel × voxel_size × sdf_trunc × min_weight` via `itertools.product`; sweep outputs go to `outputs/sweeps/`.
-- **Output:** `outputs/vdbfusion_reconstruction*.ply` / `.vdb`.
+- **Why asymmetric:** it operationalizes the priority from §3.2. Complex geometry owns transitions; flat surfaces yield to it and only tile amongst themselves. The trim is deliberately a simple core-box clip of the overlap — an earlier design that subtracted complex bounding boxes from planar meshes was abandoned because it could delete whole regions.
+- **Trade-off:** the trim box is axis-aligned. At planar boundaries that are not axis-aligned, a box clip can leave small gaps or slivers of overlap. And the no-trim complex policy is what creates the complex–complex overlap risk noted in §3.2.
 
-[`scripts/run_vdbfusion.py`](scripts/run_vdbfusion.py) — thin subprocess wrapper that invokes `vdbfusion_reconstruction.py` from the repo root. **Bug:** line 40 references an undefined name `start` → `NameError` at the end of a successful run (cosmetic; reconstruction itself completes). Prefer running `vdbfusion_reconstruction.py` directly.
+### 3.6 Subsampling: only where it's free
+Planar units (after overlap expansion) can be huge, so they are voxel-downsampled until under a point cap (`planar_max_pts`, 300 k). Complex units are **not** subsampled — their size is controlled by region growth instead.
 
-[`scripts/mesh_to_dataset.py`](scripts/mesh_to_dataset.py) — utility (vendored from VDBFusion's MIT example). `mesh_to_tsdf(filename, scan_count, scan_resolution)` uses `mesh_to_sdf` to render virtual depth scans of an input mesh and writes `results/000000.ply…` + `results/poses.txt` (a KITTI-style posed-scan dataset). Not wired into the current `vdbfusion_reconstruction.py` (which only does single-origin LAS integration). Likely from an earlier KITTI-style experiment **(verify with team)**. Uses `argh`, `mesh_to_sdf`, `trimesh` — none in `requirements.txt`.
+- **Why:** downsampling a flat surface loses no reconstructable signal (the plane is over-determined), so it's an essentially free memory saving. Downsampling complex geometry *would* lose detail, so detail there is preserved and bounded the other way (smaller regions).
 
-[`scripts/poisson_meshing.py`](scripts/poisson_meshing.py) — **Screened Poisson baseline** via `o3d…create_from_point_cloud_poisson`. Reads [`configs/poisson_config.yaml`](configs/poisson_config.yaml), trims low-density vertices by percentile, transfers color from source points via `scipy` KDTree NN. Output `outputs/poisson_reconstruction.ply`.
+### 3.7 Trusting scanner normals
+Normals are read directly from the NavVis-exported PLY rather than estimated from the points.
 
-[`scripts/pcd_meshing.py`](scripts/pcd_meshing.py) — block Delaunay/visibility mesher via the `pcdmeshing` package (`run_block_meshing`). **No config** — input path, block size (20 m), and options are hardcoded. Output `outputs/pcd_reconstruction.ply`. Not one of the proposal's named baselines; extra comparison method. Note: the proposal lists **Ball Pivoting Algorithm (BPA)** as a baseline — **BPA is not implemented anywhere in the repo** (see §8).
+- **Why:** every implicit method here (NKSR and Poisson) depends critically on *consistent, oriented* normals; estimating and globally orienting normals on a building-scale cloud is slow and error-prone. The scanner already provides them.
+- **Trade-off / risk:** the whole pipeline inherits the quality of those normals. If they are noisy or inconsistently oriented in places, NKSR degrades there with no safeguard — a worthwhile thing to sanity-check.
 
-### Stage D — Visualization
+### 3.8 Color as a decoupled texture field
+Geometry is reconstructed from xyz + normals; color is attached afterward as a learned NKSR texture field sampled from the colored input points. Geometry and appearance are kept independent — color never influences the surface.
 
-[`scripts/view_mesh.py`](scripts/view_mesh.py) — loads the three meshes and logs them to a [`rerun`](https://rerun.io) viewer for side-by-side visual comparison. **Bug:** line 14 reads `outputs/possoin_reconstruction.ply` (misspelled "possoin") while `poisson_meshing.py` writes `outputs/poisson_reconstruction.ply` → this script will fail unless the file is renamed. Paths are hardcoded.
+### 3.9 Robustness: per-unit failure isolation
+If NKSR fails on a unit (out-of-memory or a fatal CUDA error), that unit is skipped rather than crashing the run, and the reconstructor is reinitialized to recover from a corrupted CUDA context.
 
-### Stage E — Quality assessment / evaluation
+- **Why:** a multi-hour building-scale run should not be lost to one pathological unit.
+- **Trade-off (important for evaluation):** failures are silent. A "successful" run can be missing whole regions with no summary of what was dropped — so quality metrics could look fine while coverage is incomplete. A per-unit success/coverage report is the obvious missing safeguard and matters directly for RQ2.
 
-[`src/quality_assessment.py`](src/quality_assessment.py) (699 lines) — metrics library. Public entry point is `evaluate_mesh(mesh, ground_truth_points, …)` (line 462). Internal helpers:
-- `_load_ply_mesh` / `_load_ply_pointcloud` (lines 28, 46) — trimesh loaders (PLY only).
-- `_spatial_voxel_sample` (line 63) — voxel-grid uniform subsampling so dense regions don't dominate metrics.
-- `_compute_point_to_mesh_distance` (line 113) — exact point-to-triangle distance via `trimesh.proximity.closest_point` on sampled cloud points.
-- Metrics: `_hausdorff_distance` (148), `_rmse_mae` (162), `_surface_smoothness` (173, *defined but unused by* `evaluate_mesh`), `_mesh_quality_stats` (195, also unused — `evaluate_mesh` inlines its own copy), `_mesh_structure_stats` (257, vertex/face/degenerate counts), `_watertightness_manifoldness` (290), `_f_score` (311, bidirectional precision/recall at a bbox-relative threshold).
-- `_create_distance_heatmap_mesh` (line 344) — Plotly Scatter3d cloud-to-mesh residual heatmap (Good/OK/Critical/Missing color bins).
-- `evaluate_mesh` (line 462) — samples once, reuses across distance/residual/visualization; returns a dict of all metrics + the Plotly figure. Toggles for each metric group.
-- **Stale docstring:** module docstring (lines 8–10) advertises `evaluate_single_mesh` and `evaluate_multiple_meshes` — **neither exists**; only `evaluate_mesh` is implemented. There is no multi-mesh comparison / metrics-table function.
-
-[`scripts/run_quality_assessment.py`](scripts/run_quality_assessment.py) (494 lines) — Tkinter GUI wrapping `evaluate_mesh`. Browse for a mesh PLY + a point-cloud PLY, choose sample size / thresholds / which metric groups to run, evaluate in a background thread, view the Plotly residual plot. Uses `sys.path.insert` to import `quality_assessment` from `src/`. Note: in the GUI, **Watertight and F-Score default to OFF** (lines 153–154); Structure/Distance/Residual/Visualization default ON.
-
-[`docs/quality_assessment/`](docs/quality_assessment/) — `README_quality_assessment.md` (usage + demo video link) and `requirements_quality_assessment.txt` (`numpy pandas scipy trimesh plotly`).
+### 3.10 Streaming the final merge
+Per-unit meshes are streamed into one binary PLY a single chunk at a time, so the complete building mesh never has to reside in memory at once. This is a scalability decision, not a cosmetic one — it removes the final whole-scene memory bottleneck (and supports a `--merge-only` re-merge without re-running the GPU work).
 
 ---
 
-## 5. Configuration
+## 4. The design in one paragraph
 
-Each reconstructor has its own YAML in [`configs/`](configs); parameters are read at the top of each script. There is **no global config and no CLI for the NKSR pipeline** (only the VDBFusion scripts take `--config`).
-
-| Config | Used by | Notes |
-|---|---|---|
-| [`configs/nksr_config.yaml`](configs/nksr_config.yaml) | `nksr_reconstruction.py`, `testing_nksr_recon.py` | The important one. Path now points to **shared** `/work/courses/3dv/team13/...` (uncommitted change in working tree). |
-| [`configs/vdbfusion_config.yaml`](configs/vdbfusion_config.yaml) | `vdbfusion_reconstruction.py` | `las_path` is **user-specific** `/work/scratch/vpacheco/...`; sweep enabled by default. `output_dir: "../outputs/"` writes to the **parent of the repo** when run from repo root (inconsistent with README's `outputs/`) — **(verify with team)**. |
-| [`configs/poisson_config.yaml`](configs/poisson_config.yaml) | `poisson_meshing.py` | `ply_path` hardcoded to `/work/scratch/oscipal/...` (user-specific). `color_knn` is read into the script but never used. |
-| [`configs/testing_config.yaml`](configs/testing_config.yaml) | **nothing** (`testing_nksr_recon.py` reads `nksr_config.yaml`, not this) | Stale/orphan config; schema differs (`complex_large_voxel_factor`, no `planar_overlap_m`). |
-
-**Knobs that matter most** (`nksr_config.yaml`):
-- `voxel.base_size` (0.1 m) and the per-class `*_voxel_factor` multipliers — effective NKSR `voxel_size`. Complex ≈ 0.015 m (`0.1 × 0.15`), planar 0.15–0.2 m. **Dominant quality/runtime/memory lever.**
-- `voxel.fine_chunk_size` (0.25 m) — granularity of the planar/complex segmentation grid.
-- `planarity.residual_threshold` (0.1) — planar vs. complex split; strongly affects how much of the scene gets expensive complex treatment.
-- `reconstruction.complex_detail_level`, `complex_mise_iter` — NKSR detail and dual-mesh MISE iterations for complex units.
-- `reconstruction.complex_max_extent_m` (2.0 m) — caps how large a complex unit can grow (memory control).
-- `reconstruction.planar_overlap_m` (0.3 m) — context margin for planar units.
-- `subsampling.planar_max_pts` (300k) — planar memory cap.
-- `misc.gpu_device` (`cuda:0`).
-
-**Dead config keys** (present in `nksr_config.yaml` but never read by the current script): `reconstruction.complex_boundary_inset_m`, the entire `subsampling.complex_oom_fallback_levels`, `complex_last_resort_pts`, `complex_last_resort_voxel_factor`. These are leftovers from an older OOM-fallback version (see git history) — do not rely on them.
-
-Hardcoded constants worth knowing: `pcd_meshing.py` block size 20 m / edge limits; `view_mesh.py` mesh paths; `mesh_to_dataset.py` `scan_count=6, scan_resolution=2048`; centroid-centering and `colors/65535` in the NKSR script.
+Decompose the scene by **difficulty, not geometry-blind grid**. Classify local cells as flat or complex; let complex regions grow first and **absorb their flat surroundings** so every object–wall transition is reconstructed with full context in one NKSR call; let the remaining flat surfaces form cheap coplanar units. Reconstruct each unit at a resolution matched to its difficulty, make **complex units win all transitions (no trim)** while flat units **overlap-and-trim** against each other, subsample only where it costs no quality, and stream-merge so nothing is bounded by total scene size. The result places unavoidable seams on flat, forgiving surfaces and spends compute only where geometry demands it.
 
 ---
 
-## 6. How to run end-to-end
+## 5. Where this could be challenged (methodological open questions)
 
-**Environment** (from [`README.md`](README.md)): the conda env is built from `requirements.txt` *plus* a shared site-packages `.pth` hack that points into the team conda env for the heavy GPU deps:
-```bash
-conda create -n 3DV --file requirements.txt
-conda activate 3DV
-echo "/work/courses/3dv/team13/miniconda13/envs/nksr/lib/python3.10/site-packages/" \
-  > ~/miniconda3/envs/3DV/lib/python3.10/site-packages/shared_env.pth
-pre-commit install
-```
-> `requirements.txt` is a conda explicit dump and **does not list `torch`, `nksr`, `fvdb`, `vdbfusion`, `pcdmeshing`, `mesh_to_sdf`, `argh`, `rerun-sdk`** (some come only via the shared `.pth`). Expect a GPU node with the team's `nksr` env on the path. **(Exact install of NKSR/fVDB is undocumented in-repo — verify with team.)**
+These are the points a reviewer (or the report) should probe:
 
-**Data:** NavVis VLX scan, cleaned in NavVis's own software (off-repo). Distributed via the Google Drive link in `README.md` §Data; recommended to stage into `/work/scratch/<user>/` or use the shared `/work/courses/3dv/team13/2026-03-09_16.19.44/`. Required files: `pointcloud.las` (xyz+RGB) and `pointcloud.ply` (xyz+normals).
+1. **Global planarity threshold.** One number governs the planar/complex split for the entire scene; results are sensitive to it and it is untuned per scene. No sensitivity analysis exists.
+2. **Order-dependent, greedy decomposition.** Region growing iterates cells in an arbitrary order; a different order can yield a different partition into units, hence a different mesh. Determinism/robustness of the decomposition is unquantified.
+3. **Complex–complex seams from the memory cap.** The point/extent caps can split a large object into untrimmed adjacent units that overlap. Frequency and visual impact unmeasured.
+4. **Axis-aligned trimming** of planar overlaps can misbehave on non-axis-aligned surface boundaries.
+5. **Silent unit failures** (§3.9) can produce incomplete meshes that still score well — a validity threat for RQ2.
+6. **Evaluation has no ground truth.** Quality is measured against the *source scan itself* as a pseudo-ground-truth, so metrics reward fidelity-to-input (including its noise) and cannot credit plausible hole-filling. This is acknowledged in the proposal but needs an explicit methodological caveat and ideally a held-out or cross-method agreement check.
+7. **fVDB absence** (§1) changes the report's framing of the contribution and must be resolved with the team.
 
-**NKSR main pipeline** (run from repo root — config path is relative):
+---
+
+## 6. Baselines — chosen to span reconstruction paradigms
+
+The baselines are not arbitrary; each represents a different surface-reconstruction philosophy, which is the point of comparing against them:
+
+- **VDBFusion — volumetric TSDF + Marching Cubes.** Fuses a truncated signed-distance volume, then polygonizes. The classical robust baseline; the repo includes a parameter sweep over voxel size / truncation / weight.
+- **Screened Poisson — global implicit.** Solves a Poisson equation for an indicator function from oriented points; needs good normals (which the project has); density trimming removes hallucinated exterior surface. The closest classical analogue to NKSR's implicit-field approach.
+- **Ball Pivoting (BPA) — interpolating/local.** Rolls a ball over the points to triangulate them directly (no implicit field). Mirrors a validated MeshLab pipeline (resample → normals → orient → pivot). Reconstructs only where data exists — no hole-filling — which makes it a useful contrast to the implicit methods.
+- **pcdmeshing — block Delaunay / visibility.** A tetrahedralization-plus-visibility mesher; an extra comparison point beyond the proposal's named baselines.
+
+Comparing a learned implicit method (NKSR) against volumetric (TSDF), global-implicit (Poisson), interpolating (BPA), and Delaunay/visibility (pcdmeshing) is what lets RQ2 say something general about *why* NKSR wins or loses, not just *that* it does.
+
+> Methodological caveat carried by the baseline configs: they currently point at a **mix of scenes** (NKSR uses the newer large-scale scan; Poisson/pcd reference the older small scene) and per-user paths. Cross-method numbers are only comparable on a common input — unify the input scene before drawing RQ2 conclusions.
+
+---
+
+## 7. Evaluation methodology (quality assessment)
+
+A dedicated tool compares a reconstructed mesh against a reference point cloud and reports cloud-to-mesh distance statistics (Hausdorff / RMSE / MAE), a residual distribution binned into Good/OK/Critical/Missing, mesh structure and watertightness/manifoldness, a bidirectional F-score, and a residual heatmap. It is built to scale (memory-mapped random sampling of the cloud; Open3D's C++ ray-casting BVH for distance queries), so it handles very large clouds.
+
+The methodologically important points (beyond §5.6):
+- The reference is a **point cloud, not a mesh** — fidelity is measured against samples of the input scan.
+- Evaluation is **per-mesh only**: there is no automated multi-method comparison harness, so cross-method comparison (the heart of RQ2) is currently manual. Building that harness is the most direct way to turn the existing tooling into a report deliverable.
+
+---
+
+## 8. State vs. proposal
+
+| Item | Status |
+|---|---|
+| NKSR core + geometry-aware chunking | ✅ Done, mature |
+| Adaptive resolution + transition-aware seam placement | ✅ Done (the contribution that exists) |
+| VDBFusion / Poisson / BPA / pcdmeshing baselines | ✅ All implemented |
+| Quality metrics + GUI (scales to large clouds) | ✅ Done |
+| **fVDB integration** (proposal headline) | ❌ Absent — resolve scope with team |
+| **Multi-method comparison harness** | ❌ Missing — RQ2 deliverable |
+| **RQ1 scalability study** (runtime/memory vs. scene size) | ❌ Not captured — only wall-clock prints |
+| Per-unit coverage/failure reporting | ❌ Missing — validity risk for RQ2 |
+
+The two unmeasured research questions (RQ1 scalability curves, RQ2 multi-method comparison) are the highest-value gaps; both are about *measurement and methodology*, not new pipeline code.
+
+---
+
+## 9. Repository cruft (brief)
+
+Minor hazards that confuse newcomers but don't affect the methodology: a diverged stale copy of the NKSR script (`scripts/testing_nksr_recon.py`), an orphan `configs/testing_config.yaml`, dead keys in `nksr_config.yaml` (an old OOM-fallback block), a `NameError` in `run_vdbfusion.py`, a hardcoded/typo'd `view_mesh.py`, and README drift (stale cell size, output name, and a removed VDBFusion `dataset_type` mode).
+
+---
+
+## 10. Environment & running
+
+A conda env from `requirements.txt` **plus** a shared site-packages `.pth` into the team's `nksr` conda env supplies the heavy GPU deps (`torch`, `nksr`, `vdbfusion`, … are not in `requirements.txt`). A CUDA GPU is required.
+
 ```bash
 conda activate 3DV
-python scripts/nksr_reconstruction.py
-# -> outputs/nksr_reconstruction.ply  (+ outputs/chunks/*.ply)
-```
-
-**Baselines:**
-```bash
+python scripts/nksr_reconstruction.py                              # main pipeline → outputs/nksr_reconstruction.ply
+python scripts/run_ball_pivoting.py                                # BPA baseline
 python scripts/vdbfusion_reconstruction.py --config configs/vdbfusion_config.yaml
 python scripts/poisson_meshing.py
-python scripts/pcd_meshing.py        # edit hardcoded input path first
+python scripts/pcd_meshing.py
+python scripts/run_quality_assessment.py                           # Tkinter GUI; needs a display
 ```
-
-**Inspect / compare:**
-```bash
-python scripts/view_mesh.py          # rerun viewer; fix the "possoin" filename first
-python scripts/run_quality_assessment.py   # Tkinter GUI; needs a display
-```
-
-**Runtime / hardware:** requires a CUDA GPU (`cuda:0`); proposal notes HPC clusters are expected for the building-scale data. Exact runtimes/memory are **not recorded in-repo** — the scripts only print wall-clock `Total time`. Scalability numbers (RQ1) are **not yet captured anywhere** — see §8/§11. **(Verify expected runtime with team.)**
-
-**Outputs:** everything lands in `outputs/` (git-ignored), except VDBFusion which the config currently sends to `../outputs/` (see §5).
-
----
-
-## 7. Baselines & evaluation
-
-| Proposal baseline | Status | Where |
-|---|---|---|
-| TSDF fusion + Marching Cubes | ✅ implemented (VDBFusion) | `scripts/vdbfusion_reconstruction.py` |
-| Screened Poisson | ✅ implemented | `scripts/poisson_meshing.py` |
-| Ball Pivoting Algorithm (BPA) | ❌ **not implemented** | — |
-| (extra) Block Delaunay mesher | ✅ implemented (`pcdmeshing`) | `scripts/pcd_meshing.py` |
-
-**Metrics** (`src/quality_assessment.py`, exposed via the GUI): cloud-to-mesh distance stats (Hausdorff, RMSE, MAE, mean/median/min/max residuum), residual distribution into Good/OK/Critical/Missing bins by configurable cm thresholds, mesh structure (vertices, faces, degenerate triangles, mean aspect ratio), watertightness/manifoldness, bidirectional F-score, and a Plotly 3D residual heatmap.
-
-**Important evaluation caveat:** there is **no ground-truth mesh**. The QA tool compares a reconstructed mesh against a *point cloud* treated as reference — and in practice the natural reference is the **source NavVis scan itself** (so metrics measure fidelity to the input, not to truth). This matches proposal §5 ("Given the lack of ground truth data… performance will be evaluated by comparing to other method's resulting meshes"), but the current tooling is **per-mesh only** — there is **no automated multi-method comparison table or batch harness**. Cross-method comparison is currently manual (run QA per mesh, or eyeball in `view_mesh.py`).
-
----
-
-## 8. Current state vs. proposal
-
-Research questions (proposal §2): **RQ1 scalability** of NKSR to building-scale scans; **RQ2 quality/robustness** vs. TSDF baselines.
-
-| Item | State |
-|---|---|
-| NavVis data acquisition & NavVis-side cleaning | Done off-repo; one scan dir referenced (`2026-03-09_16.19.44`). Repo has no acquisition code (expected). |
-| NKSR integrated as core mesher | ✅ Done — `scripts/nksr_reconstruction.py`, with color texture field. |
-| Geometry-aware chunking (region growing) | ✅ Done and fairly mature. |
-| **fVDB integration** (proposal's headline contribution) | ❌ **Missing.** No `fvdb` import anywhere; chunking is custom NumPy/dict. NKSR's internal sparse grid is the only sparse structure. **Largest divergence from the proposal.** |
-| TSDF+MC baseline (VDBFusion) | ✅ Done + parameter sweep. |
-| Poisson baseline | ✅ Done. |
-| BPA baseline | ❌ Missing (proposal explicitly lists it). |
-| Extra `pcdmeshing` baseline | ✅ Done (not in proposal). |
-| Quality metrics library | ✅ Done (single-mesh). |
-| Quality GUI | ✅ Done (Tkinter, needs display). |
-| Multi-method comparison harness / results tables | ❌ Missing (`evaluate_multiple_meshes` advertised in docstring but unimplemented). |
-| RQ1 scalability study (runtime/memory vs. scene size) | ❌ Not captured — only wall-clock prints; no instrumentation, no size sweep, no report. |
-| RQ2 quality comparison report/figures | ⚠️ Partial — tooling exists, but no committed comparative results/visualizations or numbers. |
-| Comparative visualizations deliverable | ⚠️ `view_mesh.py` exists but has a path bug; no saved figures in repo. |
-
-**No `TODO/FIXME/HACK/XXX` comments** exist in the codebase (grep returns nothing). Incompleteness is instead in the form of: the duplicate `testing_nksr_recon.py`, stale `testing_config.yaml`, dead NKSR config keys (§5), the commented-out `write_ply_uint` call, stale README VDBFusion section (mentions a `dataset_type: kitti/las` mode the current `vdbfusion_reconstruction.py` no longer has — that existed in the earlier `f24ebf9` version), the `view_mesh.py` filename typo, and the `run_vdbfusion.py` `start` `NameError`. The empty [`src/3d_vision/__init__.py`](src/3d_vision/__init__.py) package is installed by `pyproject.toml` but unused (the real library is `src/quality_assessment.py`, imported by path, not as the package).
-
----
-
-## 9. Contributor map
-
-From `git log --all` (authors normalized; some used multiple names):
-
-| Teammate | Git identities | Owns |
-|---|---|---|
-| **Otto Scipal** | `Otto Scipal`, `oscipal` | NKSR pipeline & chunking (`nksr_reconstruction.py`, `testing_nksr_recon.py`), Poisson baseline (`poisson_meshing.py`), `pcd_meshing.py`, `view_mesh.py`, `nksr/poisson/testing` configs, README reconstruction section, `requirements.txt`. Most of the core meshing code. |
-| **Victor Pacheco Aznar** | `vpacheco` | VDBFusion baseline end-to-end (`vdbfusion_reconstruction.py`, `run_vdbfusion.py`, `mesh_to_dataset.py`, `configs/vdbfusion_config.yaml`), parameter sweeps, several `main` merges. |
-| **Jeffrey Leisi** | `JeffreyLeisi` | Quality assessment subsystem (`src/quality_assessment.py`, `scripts/run_quality_assessment.py`, `docs/quality_assessment/`). |
-| **David Clara** | `David Clara`, `dclara` | Repo scaffolding (initial commit, `pyproject.toml`, `src` package, initial README), added `Proposal.pdf`. *(This is you — the 5th member; mostly setup commits so far.)* |
-| **Luca Dominiak** | — | **No commits found in git history.** (Listed as an author on the proposal; **verify division of labor with team.**) |
-
-**Commits in the last ~4 weeks (since ≈2026-04-21, today = 2026-05-19):**
-- `b35d21b` 2026-05-19 David Clara — added proposal pdf
-- `502b8c0` 2026-05-19 Jeffrey — docs: QA README + requirements
-- `9f05e25` 2026-05-19 Jeffrey — feat: add quality assessment (`+1194` lines: `quality_assessment.py`, `run_quality_assessment.py`)
-- `84d5aa4` 2026-05-18 Otto — Merge PR #4
-- `0a91652` 2026-05-08 Victor — sweep optimal parameters found (vdbfusion config)
-- `67004dd` 2026-05-01 Victor — sweep config vdbfusion
-- `8bb600a` 2026-05-01 Victor — rewrite of vdbfusion_reconstruction (+ `mesh_to_dataset.py`, `run_vdbfusion.py`)
-- `f24ebf9`/`958c7db`/`9a3c5d5`/`26b0ede` 2026-04-27 Victor — first VDBFusion approximation + merges bringing Otto's NKSR work onto `main`
-
-Net: recent activity is QA (Jeffrey, very recent) and VDBFusion sweeps (Victor). The NKSR core (Otto) has been stable since mid-April (`daad6c6`, 2026-04-13).
-
----
-
-## 10. Concepts to brush up on
-
-- **NKSR — Neural Kernel Surface Reconstruction** ([paper](https://arxiv.org/abs/2305.19590), [code](https://github.com/nv-tlabs/NKSR)). The core mesher. Learns compactly-supported kernels on a hierarchical sparse voxel grid, solves a sparse linear system for an implicit field, extracts a dual mesh. → `run_nksr()` in [`scripts/nksr_reconstruction.py:264`](scripts/nksr_reconstruction.py). Key API: `reconstructor.reconstruct(pts, normals, detail_level, voxel_size)`, `field.set_texture_field(nksr.fields.PCNNField(...))`, `field.extract_dual_mesh(mise_iter=...)`.
-- **Neural Kernel Fields (NKF)** — NKSR's predecessor; explains the "learnable kernel + regression solve" idea NKSR makes sparse/scalable. Conceptual background for why NKSR scales.
-- **fVDB — sparse voxel deep-learning framework** ([repo](https://github.com/openvdb/fvdb-core)). Proposal's intended scalability backbone. **Not used in code yet** — read this if you pick up the missing-fVDB-integration task (§11).
-- **TSDF fusion + Marching Cubes** — classic baseline: integrate a truncated signed-distance volume then polygonize. Implemented via VDBFusion → [`scripts/vdbfusion_reconstruction.py:40`](scripts/vdbfusion_reconstruction.py) (`sdf_trunc`, `voxel_size`, `min_weight`, `space_carving`).
-- **Screened Poisson Surface Reconstruction** — solves a Poisson equation for an indicator function from oriented points; needs good normals; density trimming removes hallucinated surface. → [`scripts/poisson_meshing.py:25`](scripts/poisson_meshing.py).
-- **Ball Pivoting Algorithm (BPA)** — rolls a ball over points to triangulate. Proposal baseline, **not implemented** — candidate contribution (§11).
-- **Oriented normals for LiDAR** — every implicit method here depends on consistent oriented normals. This project trusts the **NavVis-exported PLY normals** rather than estimating them (README "Normals from PLY"); loaded at [`scripts/nksr_reconstruction.py:74`](scripts/nksr_reconstruction.py). If normals are wrong/inconsistent, NKSR and Poisson both degrade — worth sanity-checking.
-- **PCA/SVD planarity & region growing** — the repo's custom chunking. Smallest/largest singular-value ratio = planarity; BFS merge with normal-similarity + coplanarity predicates. → `fit_plane`, region-growing loops in `nksr_reconstruction.py`.
-
----
-
-## 11. Open questions & risks (where you could contribute on limited time)
-
-Ordered roughly by impact-vs-effort for someone catching up:
-
-1. **fVDB integration is missing** — the proposal's headline contribution. High impact, high effort. At minimum, document the decision: was custom region-growing chosen *instead of* fVDB, or is fVDB-backed chunking still planned? **(Resolve with team first — this affects the report's framing.)**
-2. **Scalability study (RQ1) is unmeasured.** Low-effort, high-value catch-up task: add timing/peak-GPU-memory instrumentation around `run_nksr()` and a scene-size sweep, produce the runtime-vs-size curve the proposal promises. Nothing currently records this.
-3. **No multi-method comparison harness.** The QA library only does one mesh at a time and `view_mesh.py` is broken (filename typo + hardcoded paths). A small script that runs `evaluate_mesh` over NKSR/VDBFusion/Poisson/pcd against the source cloud and emits one comparison table/figure directly produces a proposal deliverable.
-4. **BPA baseline missing** — proposal explicitly lists it; ~30 lines with `o3d…create_from_point_cloud_ball_pivoting`. Easy, self-contained, completes the baseline set.
-5. **Reproducibility/path fragility.** `poisson_config.yaml`, `pcd_meshing.py`, `vdbfusion_config.yaml` hardcode per-user `/work/scratch/<name>/` paths; only `nksr_config.yaml` was switched to the shared `/work/courses/3dv/team13/` path (uncommitted). Unifying onto the shared path is trivial and unblocks everyone.
-6. **Code hygiene risks:** `testing_nksr_recon.py` duplicates `nksr_reconstruction.py` (drift risk — which is canonical?); `run_vdbfusion.py` `NameError`; `view_mesh.py` "possoin" typo; dead NKSR config keys; stale `testing_config.yaml`; stale README VDBFusion section. Individually minor, collectively confusing for a newcomer (and for graders).
-7. **Evaluation validity:** metrics use the source scan as pseudo-ground-truth, so they reward overfitting to input noise and can't detect plausible hole-filling as "good." Worth a short methodological note in the report, and possibly a held-out region or cross-method agreement metric. The QA `_surface_smoothness` and standalone `_mesh_quality_stats` exist but are unused by `evaluate_mesh` — wiring smoothness in is a cheap robustness signal.
-8. **NKSR robustness untested at scale.** `run_nksr` swallows OOM/RuntimeError per unit and silently skips — a large run can produce a mesh with missing regions and no summary of what failed. Adding a per-unit success/failure report would surface silent quality loss.
-
----
-
-*Generated by surveying every source file, config, doc, and the full `git log --all` history. Uncertain points are marked **(verify with team)**; resolve those before relying on them in the report.*
+The NKSR script also exposes `--save-boundaries` / `--save-voxel-grid` (export the decomposition as wireframes — useful for explaining the method in the report) and `--merge-only` (re-merge existing chunks without GPU work).
