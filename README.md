@@ -1,137 +1,120 @@
 # LiDAR to Mesh using Neural Kernel Surface Reconstruction
 
-## Related work
+Semester Project in 3D Vision at ETH Zurich - Spring 2026
 
-- [Neural Kernel Surface Reconstruction](https://github.com/nv-tlabs/NKSR)
-- [fVDB](https://github.com/openvdb/fvdb-core)
-- [PCD Meshing](https://github.com/cvg/pcdmeshing)
-- [POCO](https://github.com/valeoai/POCO)
-- [VDBFusion](https://github.com/PRBonn/vdbfusion)
+## ⚙️ Setup
 
-## Setup
-
-### Repository
+### 📦 Repository
 
 Clone the repository:
+
 ```bash
-git clone git@github.com:dav1dclara/3d-vision.git
-cd 3d-vision/
+git clone git@github.com:dav1dclara/lidar2mesh.git
+cd lidar2mesh/
 ```
 
-### Dependencies
+### ⛓️ Dependencies
 
-Create a Python environment, then install the dependencies:
+Create a conda environment, then install the dependencies:
+
 ```bash
 conda create -n 3DV python=3.10
 conda activate 3DV
-pip install -r requirements.txt
-# GPU/external deps (torch, nksr, pcdmeshing) come from the team's shared env:
+python -m pip install -r requirements.txt
+python -m pip install -e .
+```
+
+The heavy GPU dependencies (`torch`, `nksr`, `pcdmeshing`) are not installed by the
+commands above. On the team cluster they are provided by the shared `nksr` conda
+environment via a site-packages `.pth` file:
+
+```bash
 echo "/work/courses/3dv/team13/miniconda13/envs/nksr/lib/python3.10/site-packages/" > ~/miniconda3/envs/3DV/lib/python3.10/site-packages/shared_env.pth
 ```
 
 Install the pre-commit hooks for automatic code formatting and linting on each commit:
+
 ```bash
 pre-commit install
 ```
 
-## Reconstruction Pipeline
+## 🚀 Usage
 
-The reconstruction pipeline converts a LiDAR point cloud into a colored triangle mesh using a geometry-aware chunking strategy combined with Neural Kernel Surface Reconstruction (NKSR).
+All commands are run from the repository root. Pipeline parameters live in `configs/`.
 
-### Overview
-```
-pointcloud.las + pointcloud.ply
-        │
-        ▼
-Fine voxelization (0.25m cells)
-        │
-        ▼
-Per-cell planarity analysis (SVD)
-        │
-        ▼
-Region growing
-  ├── Complex regions grow first, absorbing all adjacent planar chunks
-  └── Remaining planar chunks form isolated planar-only regions
-        │
-        ▼
-NKSR reconstruction per region
-  ├── Complex units → high detail (vox=0.05m, detail=1.0, mise=2)
-  └── Planar-only units → lower detail (vox=0.15-0.2m, detail=0.3-0.5)
-        │
-        ▼
-Merge all chunks → nksr_reconstruction.ply
-```
+### 🧰 Preprocessing — `scripts/tools/`
 
-### Key design decisions
+Optionally crop a region of interest from a large point cloud, or convert a mesh into a TSDF dataset:
 
-**Geometry-aware chunking** — instead of splitting the scene into a regular grid (which cuts through surfaces and creates boundary artifacts), the scene is first split into uniform 0.25m cells, then each cell's planarity is estimated using PCA/SVD. The ratio of the smallest to largest singular value gives a residual — low residual means flat, high residual means complex geometry.
-
-**Complex-first region growing** — complex regions (objects, furniture, people) grow first and greedily absorb all neighbouring planar chunks (walls, floors, ceilings). This means NKSR sees the full context of every edge — the wall and the object in the same reconstruction call — producing clean transitions without stitching artifacts. Only planar chunks that are never touched by a complex region form their own isolated planar reconstruction units.
-
-**Adaptive quality** — complex units are reconstructed at the highest detail level with a fine voxel size (0.05m). Planar-only units use coarser voxels (0.15-0.2m) since flat surfaces reconstruct well at lower resolution, saving significant GPU time.
-
-**Normals from PLY** — the NavVis scanner stores precomputed normals directly in the PLY file, which are used directly instead of estimating them from scratch (saving several minutes per run).
-
-### Configuration
-
-All parameters are set in `configs/nksr_config.yaml`
-
-### Running
 ```bash
-conda activate 3DV
+python scripts/tools/crop_region.py --input scene.ply --output crop.ply --center X Y Z --radius R
+python scripts/tools/mesh_to_dataset.py <mesh.ply>
+```
+
+### 🏗️ Reconstruction — `scripts/reconstruction/`
+
+Reconstruct a mesh from the point cloud. NKSR is the main method; four classical baselines are also provided.
+
+All reconstruction parameters — input/output paths, voxel sizes, thresholds, and per-method settings — live in the [`configs/`](configs) folder, one YAML file per method (`nksr_config.yaml`, `vdbfusion_config.yaml`, `poisson_config.yaml`, `pcd_config.yaml`, `bpa_config.yaml`). Adapt them to your data before running — in particular the input point-cloud paths and output directory, which currently point at the team's cluster paths.
+
+```bash
+# NKSR (main pipeline)
 python scripts/reconstruction/run_nksr_reconstruction.py
+
+# Baselines
+python scripts/reconstruction/run_vdbfusion_reconstruction.py --config configs/vdbfusion_config.yaml
+python scripts/reconstruction/run_poisson_reconstruction.py
+python scripts/reconstruction/run_pcd_reconstruction.py
+python scripts/reconstruction/run_ball_pivoting_reconstruction.py
 ```
 
-Output is written to `outputs/nksr_reconstruction.ply`. Individual chunk PLYs are saved to `outputs/chunks/` during reconstruction and can be inspected separately.
+Each method writes its mesh to the `output_dir`/`output_mesh` path set in its config (`out_path` for Ball Pivoting). With the default config, NKSR produces `nksr_reconstruction.ply` plus the individual per-region meshes under `<output_dir>/chunks/`, and VDBFusion additionally writes a `.vdb` grid alongside the `.ply`.
 
-### Output
+### 📊 Evaluation — `scripts/evaluation/`
 
-The pipeline produces a colored triangle mesh in PLY format with per-vertex RGB colors projected from the original LiDAR scan. The mesh can be viewed in CloudCompare, MeshLab, or using the provided viewer script:
+Evaluate a reconstructed mesh against a reference point cloud (interactive GUI):
+
 ```bash
-python scripts/visualization/view_mesh.py outputs/nksr_reconstruction.ply
-```
-
-## Mesh Quality Assessment
-
-Evaluate a reconstructed mesh against a LiDAR ground-truth point cloud. Computes cloud-to-mesh distances, residual distribution, aspect ratios, and produces an interactive 3D heatmap.
-
-### Running (GUI)
-```bash
-conda activate 3DV
 python scripts/evaluation/run_quality_assessment.py
 ```
 
-Select a mesh (`.ply`) and a point cloud (`.ply`), set the desired sample size and thresholds, then click **Evaluate**.
+### 🎥 Visualization — `scripts/visualization/`
 
-### Notes on large point clouds
-The loader uses `numpy.memmap` to randomly sample the point cloud without loading the full file into RAM. Only the requested number of points (default 50 000) are paged in from disk — a 800 M-point cloud (≈ 20 GB) requires only ≈ 200 MB of physical RAM during loading.
+Inspect meshes, point clouds, and reconstruction chunks:
 
-Distance queries use Open3D's `RaycastingScene` (C++ BVH, float32 internally) instead of trimesh, making the computation safe for meshes with tens of millions of faces.
-
-### Metrics
-| Metric | Description |
-|---|---|
-| Hausdorff / RMSE / MAE | Cloud-to-mesh distance statistics |
-| Residual distribution | % of points in Good / OK / Critical / Missing bands |
-| Mean aspect ratio | Triangle quality (sampled, 10 000 faces) |
-| Degenerate triangles | Faces with area < 1e-10 (extrapolated from sample) |
-| Watertight / Manifold | Topology check (optional, vectorized) |
-| F-Score | Bidirectional matching precision/recall (optional) |
-
-## VDBFusion Experiment
-
-This repository now includes an experimental VDBFusion pipeline inspired by the KITTI odometry notebook.
-
-Install VDBFusion first:
 ```bash
-pip install vdbfusion
+# quick Rerun view
+python scripts/visualization/view_mesh.py outputs/nksr_reconstruction.ply
+
+# render / screenshot
+python scripts/visualization/viewer.py --input cloud.ply --interactive
+
+# first-person walkthrough
+python scripts/visualization/walk.py --mesh scene.ply
+
+# browse chunks
+python scripts/visualization/browse_chunks.py --chunks-dir outputs/chunks
 ```
 
-Point `input.las_path` in `configs/vdbfusion_config.yaml` at your LAS point cloud, then run:
-```bash
-python scripts/reconstruction/run_vdbfusion_reconstruction.py --config configs/vdbfusion_config.yaml
-```
+## 📚 Documentation
 
-Outputs:
-- `outputs/vdbfusion_reconstruction.ply`
-- `outputs/vdbfusion_reconstruction.vdb`
+Detailed per-method documentation (overview, configuration, tuning, and pipeline steps) lives in [`docs/`](docs):
+
+- [NKSR](docs/README_nksr.md) — main pipeline
+- [VDBFusion](docs/README_vdbfusion.md) — volumetric TSDF baseline
+- [Screened Poisson](docs/README_poisson.md) — global-implicit baseline
+- [pcdmeshing](docs/README_pcd.md) — block Delaunay baseline
+- [Ball Pivoting](docs/README_bpa.md) — interpolating baseline
+- [Quality Assessment](docs/README_quality_assessment.md) — mesh evaluation tool
+
+## 👥 Authors
+
+- Victor Pacheco Aznar
+- Otto Scipal
+- David Clara
+- Jeffrey Leisi
+- Luca Dominiak
+
+## 📄 License
+
+This project is licensed under the MIT License — see [LICENSE](LICENSE) for details.

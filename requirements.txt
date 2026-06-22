@@ -1,4 +1,4 @@
-# Python dependencies for the 3d-vision pipeline.
+# Python dependencies for the lidar2mesh pipeline.
 #   pip install -r requirements.txt
 #
 # Version markers are lower bounds (known-good releases). Run `pip freeze`
